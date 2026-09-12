@@ -1,0 +1,639 @@
+# # Master-only projected AgFEM system: E and the solve operator B = EᵀAE.
+#
+# `StaticSystem` combines a static assembly layout (fixed quadrature tables,
+# element tables, cached scatter slots — rebuilt only on a geometry refresh)
+# with the AgFEM projection. The public math objects are:
+#
+#   E   : n_bg × n_m   extension operator (prolongation), a real sparse matrix
+#   B   : n_m × n_m    projected solve operator = EᵀAE (SPD for coercive forms)
+#   b_m : n_m          projected right-hand side = Eᵀb
+#
+# `assemble!` returns `(B, b_m)`. The solution lives on the n_m master
+# (stable) DOFs; `E` (stored at `system.refresh.E`) maps it back to the full
+# background lattice with one matmul (`u_full = E * u_m`, allocation-free via
+# `mul!`; `restrict_solution!` extracts its master rows). `B` is a real sparse matrix, so
+# `cholesky(B)` or `Preconditioners.jl` work directly.
+#
+# Systems are single-owner and non-reentrant: `B`, `b_m`, and the coefficient
+# buffers are overwritten by the next `assemble!`, and `refresh_geometry!`
+# rebuilds the extension tables and B's sparse pattern when the roots move.
+
+"""
+    StaticSystem(mesh, cutdata, aggregate_roots;
+                 form, interior_quadrature=nothing, cut_quadrature=nothing)
+
+Master-only projected AgFEM system. `mesh` and `cutdata` are the
+background triangulation and cut-triangulation descriptors (see
+Descriptors.jl) and `aggregate_roots` one root cell per background cell.
+`form` is a construction-only input: the element variational form whose
+element tables are generated at construction (see Forms.jl); only the
+generated tables (finite elements and basis-at-quadrature data) are retained,
+never the physics. Requires identical test and trial finite elements
+(possibly mixed, as tuples of `FiniteElement` blocks). Accepts
+aggregate-root changes on `refresh_geometry!`.
+
+`interior_quadrature` supplies `(r,s)` points on `[0,1]²` and normalized
+weights; `cut_quadrature` supplies barycentric triangle points and normalized
+weights. Each accepts a `(points, weights)` pair or an object exposing
+`points` and `weights`. `nothing` selects the dominant element's conservative
+default. Rules are validated and copied once; geometry refresh only remaps the
+cached cut rule. The defaults integrate test/trial basis products multiplied by
+a Q1 coefficient; nonlinear `StateFunction`s may require higher-order rules.
+"""
+struct RefreshCache{T,LK}
+    element_tables::LK
+    quadrature::CutQuadrature{T}
+    quadrature_buffer::CutQuadratureStaging{T}
+    cell_states::Vector{Int8}
+    last_roots::Vector{Int32}
+    E::SparseMatrixCSC{T,Int}
+    master_rows::Vector{Int}
+    coefficient_prolongation::SparseMatrixCSC{T,Int}
+    coefficient_nodes::Matrix{Int32}
+end
+
+struct AssembleCache{T,N,MT}
+    B::MT
+    b_m::Vector{T}
+    test_cell_dofs::Vector{Vector{Int32}}
+    test_constraints::Vector{Matrix{T}}
+    scatter_slots::Vector{Vector{Int}}
+    pattern_rows::Vector{Vector{Int}}
+    colors::Vector{Vector{Int32}}
+    thread_buffers::Vector{ThreadBuffer{T}}
+    extended_coefficients::NTuple{N,Vector{T}}
+end
+
+mutable struct StaticSystem{T,N,LK,MT}
+    nx::Int
+    ny::Int
+    hx::T
+    hy::T
+    mesh_id::Any
+    interior_quadrature::_ReferenceQuadrature{2,T}
+    cut_quadrature::_ReferenceQuadrature{3,T}
+    refresh::RefreshCache{T,LK}
+    assemble::AssembleCache{T,N,MT}
+end
+
+function _validate_projected_aggregates(bg_states, aggregate_roots, ncells::Int)
+    length(bg_states) == ncells ||
+        throw(ArgumentError("level-set cell count does not match the background mesh"))
+    length(aggregate_roots) == ncells ||
+        throw(ArgumentError("one aggregate root is required per background cell"))
+    for cell in 1:ncells
+        state = bg_states[cell]
+        _valid_bg_state(state) || throw(ArgumentError("invalid background-cell state"))
+        state == OUT && continue
+        root = Int(aggregate_roots[cell])
+        1 <= root <= ncells ||
+            throw(ArgumentError("active background cell $cell has no valid aggregate root"))
+        bg_states[root] != OUT ||
+            throw(ArgumentError("aggregate root $root is outside the active domain"))
+        Int(aggregate_roots[root]) == root ||
+            throw(ArgumentError("aggregate root $root is not self-rooted"))
+    end
+    return nothing
+end
+
+@inline function _projection_structure_changed(old_states, old_roots,
+                                               new_states, new_roots)
+    @inbounds for cell in eachindex(old_states)
+        old_active = old_states[cell] != OUT
+        new_active = new_states[cell] != OUT
+        old_active == new_active || return true
+        new_active && old_roots[cell] != new_roots[cell] && return true
+    end
+    return false
+end
+
+# Extension weights: the slave node's value is the root cell's basis
+# interpolated at the slave node's position. On the structured background grid
+# the slave node's reference position within the root cell is its lattice
+# offset (integer for Q1, half-integer for Q2), so the weights are exactly
+# `shape(el, offset)` — the same values the Gridap basis evaluation produced
+# (see the projected-operator equivalence tests), without requiring Gridap at
+# runtime.
+@inline function _extension_weights(el::ReferenceFiniteElement,
+                                    nx::Int, node::Int, root_cell::Int)
+    nodes_x = node_grid(el, nx)
+    i = (node - 1) % nodes_x + 1
+    j = (node - 1) ÷ nodes_x + 1
+    i_root = (root_cell - 1) % nx + 1
+    j_root = (root_cell - 1) ÷ nx + 1
+    scale = lattice_scale(el)
+    r = scale * (i - 1) - (i_root - 1)
+    s = scale * (j - 1) - (j_root - 1)
+    return shape(el, r, s)
+end
+
+# Factored E rows for one lattice, used transiently by a structural refresh:
+# `count[node]` nonzeros, `nodes[:, node]` support targets, `weights[:, node]`
+# values. Master rows are unit rows; inactive rows are empty. `is_master` and
+# `representative` are scratch for the scan. Nothing here persists past the
+# refresh that materializes E and the per-cell C tables.
+function _extension_row_supports!(count::Vector{UInt8}, nodes::Matrix{Int32},
+                                  weights::Matrix{T}, is_master::BitVector,
+                                  representative::Vector{Int32},
+                                  el::ReferenceFiniteElement,
+                                  bg_states, aggregate_roots, nx::Int,
+                                  ny::Int) where {T}
+    nnodes = length(count)
+    nnode_el = nnode(el)
+    fill!(is_master, false)
+    fill!(representative, 0)
+    fill!(count, 0)
+    fill!(nodes, 0)
+    fill!(weights, zero(T))
+
+    # ponytail: scan the fixed mesh; switch to dirty-cell updates only if this is measurable.
+    @inbounds for cell in 1:(nx * ny)
+        bg_states[cell] == OUT && continue
+        is_root = Int(aggregate_roots[cell]) == cell
+        for local_node in 1:nnode_el
+            node = Int(cell_nodes(el, cell, nx)[local_node])
+            representative[node] = Int32(cell)
+            is_master[node] |= is_root
+        end
+    end
+
+    for node in 1:nnodes
+        if is_master[node]
+            count[node] = 1
+            nodes[1, node] = Int32(node)
+            weights[1, node] = one(T)
+            continue
+        end
+        representative_cell = Int(representative[node])
+        representative_cell == 0 && continue
+        root = Int(aggregate_roots[representative_cell])
+        extension = _extension_weights(el, nx, node, root)
+        count[node] = UInt8(nnode_el)
+        @inbounds for root_node in 1:nnode_el
+            target = Int(cell_nodes(el, root, nx)[root_node])
+            is_master[target] ||
+                error("AgFEM extension targets a non-master background node")
+            weight = T(extension[root_node])
+            isfinite(weight) || throw(ArgumentError("AgFEM extension contains a non-finite weight"))
+            nodes[root_node, node] = target
+            weights[root_node, node] = weight
+        end
+    end
+    return is_master
+end
+
+# Structural refresh core: build transient factored E rows per block, number
+# the compact master DOFs block-major, fill the per-cell C tables in place,
+# and materialize E (solution prolongation) and the Q1 coefficient
+# prolongation as sparse matrices. Same math as the previous stored tables;
+# only the storage changed.
+function _refresh_static_tables!(::Type{T}, cell_dofs, constraints, spaces,
+                                  bg_states, aggregate_roots, nx::Int,
+                                  ny::Int) where {T}
+    nblocks = length(spaces)
+    ncells = nx * ny
+    rows = map(spaces) do space
+        el = space.element
+        nnodes = node_grid(el, nx) * node_grid(el, ny)
+        nnode_el = nnode(el)
+        count = zeros(UInt8, nnodes)
+        nodes = zeros(Int32, nnode_el, nnodes)
+        weights = zeros(T, nnode_el, nnodes)
+        node_compact = zeros(Int32, nnodes)
+        is_master = falses(nnodes)
+        representative = zeros(Int32, nnodes)
+        _extension_row_supports!(count, nodes, weights, is_master, representative,
+                                 el, bg_states, aggregate_roots, nx, ny)
+        (; count, nodes, weights, node_compact, is_master, el,
+           nc=ncomp(space), nnode_el)
+    end
+    n_bg = sum(r.nc * length(r.count) for r in rows)
+
+    I = Int[]
+    J = Int[]
+    V = T[]
+    base = 1
+    row_offset = 0
+    for r in rows
+        nnodes = length(r.count)
+        rank = 0
+        @inbounds for node in eachindex(r.is_master)
+            if r.is_master[node]
+                rank += 1
+                r.node_compact[node] = Int32(base + (rank - 1) * r.nc)
+            end
+        end
+        base += rank * r.nc
+        @inbounds for node in 1:nnodes, comp in 1:r.nc
+            row = row_offset + r.nc * (node - 1) + comp
+            for support in 1:Int(r.count[node])
+                push!(I, row)
+                push!(J, Int(r.node_compact[Int(r.nodes[support, node])]) + comp - 1)
+                push!(V, r.weights[support, node])
+            end
+        end
+        row_offset += r.nc * nnodes
+    end
+    n_m = base - 1
+    master_rows = Vector{Int}(undef, n_m)
+    row_offset = 0
+    for r in rows
+        nnodes = length(r.count)
+        @inbounds for node in 1:nnodes
+            r.is_master[node] || continue
+            for comp in 1:r.nc
+                master_rows[Int(r.node_compact[node]) + comp - 1] =
+                    row_offset + r.nc * (node - 1) + comp
+            end
+        end
+        row_offset += r.nc * nnodes
+    end
+    E = sparse(I, J, V, n_bg, n_m)
+
+    nnodes_q1 = (nx + 1) * (ny + 1)
+    qcount = zeros(UInt8, nnodes_q1)
+    qnodes = zeros(Int32, 4, nnodes_q1)
+    qweights = zeros(T, 4, nnodes_q1)
+    _extension_row_supports!(qcount, qnodes, qweights, falses(nnodes_q1),
+                             zeros(Int32, nnodes_q1), Q1ReferenceQuadrilateral(),
+                             bg_states, aggregate_roots, nx, ny)
+    Iq = Int[]
+    Jq = Int[]
+    Vq = T[]
+    for node in 1:nnodes_q1, support in 1:Int(qcount[node])
+        push!(Iq, node)
+        push!(Jq, Int(qnodes[support, node]))
+        push!(Vq, qweights[support, node])
+    end
+    P = sparse(Iq, Jq, Vq, nnodes_q1, nnodes_q1)
+
+    # Per-cell effective (master) DOFs and raw→effective constraint matrices.
+    # `C[eff_local, raw_local]` is the weight with which raw local DOF
+    # `raw_local` enters effective master `eff_local`; the transform `C·K·Cᵀ`
+    # projects one cell's raw block onto the master DOFs.
+    old_length = length(cell_dofs)
+    resize!(cell_dofs, ncells)
+    resize!(constraints, ncells)
+    for cell in (old_length + 1):ncells
+        cell_dofs[cell] = Int32[]
+        constraints[cell] = Matrix{T}(undef, 0, 0)
+    end
+    masters = Int32[]
+    for cell in 1:ncells
+        eff_dofs = cell_dofs[cell]
+        empty!(eff_dofs)
+        if bg_states[cell] == OUT
+            isempty(constraints[cell]) ||
+                (constraints[cell] = Matrix{T}(undef, 0, 0))
+            continue
+        end
+        C = constraints[cell]
+        for b in 1:nblocks
+            r = rows[b]
+            nnode_el = r.nnode_el
+            nc = r.nc
+            raw_nodes = cell_nodes(r.el, cell, nx)
+            empty!(masters)
+            @inbounds for lnode in 1:nnode_el
+                node = raw_nodes[lnode]
+                for support in 1:Int(r.count[node])
+                    m = r.nodes[support, node]
+                    m in masters || push!(masters, m)
+                end
+            end
+            sort!(masters)
+            neff = length(masters) * nc
+            nraw = nnode_el * nc
+            Cb = if nblocks == 1 && size(C) == (neff, nraw)
+                fill!(C, zero(T))
+            else
+                zeros(T, neff, nraw)
+            end
+            @inbounds for (rank, m) in enumerate(masters)
+                base = r.node_compact[m]
+                for comp in 1:nc
+                    push!(eff_dofs, base + comp - 1)
+                end
+            end
+            @inbounds for lnode in 1:nnode_el
+                node = raw_nodes[lnode]
+                for support in 1:Int(r.count[node])
+                    m = r.nodes[support, node]
+                    w = r.weights[support, node]
+                    rank = searchsortedfirst(masters, m)
+                    for comp in 1:nc
+                        eff_local = (rank - 1) * nc + comp
+                        raw_local = lnode + nnode_el * (comp - 1)
+                        Cb[eff_local, raw_local] = w
+                    end
+                end
+            end
+            if b == 1
+                C = Cb
+            else
+                Cnew = Matrix{T}(undef, size(C, 1) + neff, size(C, 2) + nraw)
+                fill!(Cnew, zero(T))
+                Cnew[1:size(C, 1), 1:size(C, 2)] .= C
+                Cnew[size(C, 1)+1:end, size(C, 2)+1:end] .= Cb
+                C = Cnew
+            end
+        end
+        constraints[cell] = C
+    end
+    return E, master_rows, P
+end
+
+# B sparse pattern from the per-cell effective DOF connectivity.
+function _pattern_from_ragged_dofs!(matrix::SparseMatrixCSC{T,Int}, row_entries,
+                                    test_dofs, trial_dofs,
+                                    ntest::Int, ntrial::Int) where {T}
+    while length(row_entries) < ntrial
+        push!(row_entries, Int[])
+    end
+    for column in 1:ntrial
+        empty!(row_entries[column])
+    end
+    for cell in eachindex(test_dofs)
+        for column in trial_dofs[cell], row in test_dofs[cell]
+            push!(row_entries[column], row)
+        end
+    end
+    same_size = size(matrix) == (ntest, ntrial)
+    colptr = matrix.colptr
+    rowval = matrix.rowval
+    nzval = matrix.nzval
+    resize!(colptr, ntrial + 1)
+    empty!(rowval)
+    colptr[1] = 1
+    for column in 1:ntrial
+        rows = row_entries[column]
+        sort!(rows)
+        previous = 0
+        for row in rows
+            row == previous && continue
+            push!(rowval, row)
+            previous = row
+        end
+        colptr[column + 1] = length(rowval) + 1
+    end
+    resize!(nzval, length(rowval))
+    fill!(nzval, zero(T))
+    return same_size ? matrix : SparseMatrixCSC(ntest, ntrial, colptr, rowval, nzval)
+end
+
+"""
+    refresh_geometry!(system::StaticSystem, cutdata, aggregate_roots)
+
+Refresh quadrature, the AgFEM extension operator `E`, and B's sparse pattern
+for a moved level set. The aggregate roots may change. Projection tables are
+retained unless active-cell membership or an active root changes. Returns
+`system`. A structural refresh invalidates matrices previously returned by
+`assemble!`; reacquire them from the next assembly call.
+"""
+function refresh_geometry!(plan::StaticSystem{T}, cutdata::CutData{T},
+                           aggregate_roots) where {T}
+    cutdata.mesh_id === plan.mesh_id ||
+        throw(ArgumentError("cut geometry belongs to a different background mesh"))
+    ncells = plan.nx * plan.ny
+    _validate_projected_aggregates(cutdata.bg_states, aggregate_roots, ncells)
+    r = plan.refresh
+    a = plan.assemble
+    states_aliased = Base.mightalias(r.cell_states, cutdata.bg_states)
+    roots_aliased = Base.mightalias(r.last_roots, aggregate_roots)
+    bg_states = states_aliased ? copy(cutdata.bg_states) : cutdata.bg_states
+    roots = roots_aliased ? collect(aggregate_roots) : aggregate_roots
+    # Projection depends on active-vs-OUT membership and roots of active cells;
+    # IN/CUT labels and roots stored on OUT cells only affect geometry data.
+    structural = states_aliased || roots_aliased ||
+                 _projection_structure_changed(
+                     r.cell_states, r.last_roots, bg_states, roots)
+    background_cells = Base.OneTo(ncells)
+    spaces = r.element_tables.test_space
+    npoints = _stage_cut_quadrature!(
+        r.quadrature_buffer, background_cells, cutdata,
+        plan.nx, plan.ny, plan.hx, plan.hy,
+        plan.cut_quadrature)
+    _commit_quadrature!(
+        r.quadrature, r.quadrature_buffer.pointers,
+        r.quadrature_buffer.is_cut,
+        r.quadrature_buffer.reference_r, r.quadrature_buffer.reference_s,
+        r.quadrature_buffer.weight, npoints)
+    @inbounds for cell in 1:ncells
+        state = bg_states[cell]
+        r.cell_states[cell] = state
+        r.last_roots[cell] = state == OUT ? Int32(0) : Int32(roots[cell])
+        r.quadrature.is_cut[cell] = state != IN
+    end
+    if structural
+        E, master_rows, P = _refresh_static_tables!(
+            T, a.test_cell_dofs, a.test_constraints, spaces, bg_states, roots,
+            plan.nx, plan.ny)
+        n_m = size(E, 2)
+        B = _pattern_from_ragged_dofs!(
+            a.B, a.pattern_rows, a.test_cell_dofs, a.test_cell_dofs, n_m, n_m)
+        slots = _ragged_scatter_slots!(
+            a.scatter_slots, B, a.test_cell_dofs, a.test_cell_dofs)
+        validate_sparse_slots(B, a.test_cell_dofs, a.test_cell_dofs, slots)
+        colors = _effective_cell_colors(a.test_cell_dofs, a.test_cell_dofs)
+        max_test = maximum(length, a.test_cell_dofs; init=0)
+        ntest_raw = sum(ndofs(space) for space in spaces)
+        buffers = [ThreadBuffer(
+            zeros(T, ntest_raw, ntest_raw), zeros(T, ntest_raw),
+            zeros(T, max_test, ntest_raw),
+            zeros(T, max_test, max_test), zeros(T, max_test),
+        ) for _ in 1:Threads.maxthreadid()]
+        resize!(a.b_m, n_m)
+        fill!(a.b_m, zero(T))
+        plan.refresh = RefreshCache(r.element_tables, r.quadrature, r.quadrature_buffer,
+                                    r.cell_states, r.last_roots, E, master_rows, P,
+                                    r.coefficient_nodes)
+        plan.assemble = AssembleCache(B, a.b_m, a.test_cell_dofs, a.test_constraints,
+                                      slots, a.pattern_rows, colors, buffers,
+                                      a.extended_coefficients)
+    end
+    _regenerate_element_tables!(plan.refresh.element_tables, plan.hx, plan.hy,
+                                 plan.refresh.quadrature, plan.nx * plan.ny,
+                                 plan.interior_quadrature)
+    return plan
+end
+
+# Validate the sparse scatter slots against the (possibly ragged) DOF maps.
+function validate_sparse_slots(matrix::SparseMatrixCSC,
+                               test_dofs::AbstractVector{<:AbstractVector},
+                               trial_dofs::AbstractVector{<:AbstractVector},
+                               slots::AbstractVector{<:AbstractVector{<:Integer}})
+    length(test_dofs) == length(trial_dofs) == length(slots) ||
+        throw(ArgumentError("cell connectivity and slot counts differ"))
+    for cell in eachindex(test_dofs)
+        length(slots[cell]) == length(test_dofs[cell]) * length(trial_dofs[cell]) ||
+            throw(ArgumentError("invalid sparse slot count for cell $cell"))
+        nt = length(test_dofs[cell])
+        for (index, column) in enumerate(trial_dofs[cell])
+            for (row_index, row) in enumerate(test_dofs[cell])
+                slot = slots[cell][row_index + nt * (index - 1)]
+                matrix.colptr[column] <= slot < matrix.colptr[column + 1] &&
+                    matrix.rowval[slot] == row ||
+                    throw(ArgumentError("invalid sparse slot for cell $cell"))
+            end
+        end
+    end
+    return true
+end
+
+function StaticSystem(
+    mesh::Mesh{T}, cutdata::CutData{T}, aggregate_roots;
+    form::ElementVariationalForm,
+    interior_quadrature=nothing,
+    cut_quadrature=nothing,
+) where {T<:AbstractFloat}
+    T === Float64 || throw(ArgumentError("the projected path requires Float64"))
+    form.ncoefficients >= 0 ||
+        throw(ArgumentError("form.ncoefficients must be nonnegative"))
+    form.test_space == form.trial_space ||
+        throw(ArgumentError("the projected path requires identical test and trial spaces"))
+    nx = mesh.nx
+    ny = mesh.ny
+    nx > 0 && ny > 0 || throw(ArgumentError("nx and ny must be positive"))
+    cutdata.mesh_id === mesh.mesh_id ||
+        throw(ArgumentError("cut geometry belongs to a different background mesh"))
+    isfinite(mesh.hx) && isfinite(mesh.hy) && mesh.hx > 0 && mesh.hy > 0 ||
+        throw(ArgumentError("background grid metrics must be finite and positive"))
+
+    ncells = nx * ny
+    element = _dominant_element(form.test_space, form.trial_space)
+    interior_source = isnothing(interior_quadrature) ?
+        interior_rule(element) : interior_quadrature
+    cut_source = isnothing(cut_quadrature) ? cut_rule(element) : cut_quadrature
+    interior = _canonical_quadrature(
+        interior_source, Val(2), T, "interior quadrature")
+    cut = _canonical_quadrature(cut_source, Val(3), T, "cut quadrature")
+    element_tables = generate_element_tables(
+        form, mesh.hx, mesh.hy, nothing, ncells, interior)
+    quadrature = CutQuadrature(
+        Vector{Int}(undef, ncells + 1), falses(ncells), T[], T[], T[])
+    staging = CutQuadratureStaging(
+        Vector{Int}(undef, ncells + 1), falses(ncells), T[], T[], T[])
+    nnodes_q1 = (nx + 1) * (ny + 1)
+    refresh = RefreshCache(
+        element_tables, quadrature, staging,
+        zeros(Int8, ncells), zeros(Int32, ncells),
+        spzeros(T, 0, 0), Int[], spzeros(T, 0, 0),
+        _cell_nodes(Q1ReferenceQuadrilateral(), Int32.(1:ncells), nx))
+    assemble = AssembleCache(
+        spzeros(T, 0, 0), T[],
+        Vector{Vector{Int32}}(), Vector{Matrix{T}}(), Vector{Vector{Int}}(),
+        Vector{Vector{Int}}(), Vector{Vector{Int32}}(), ThreadBuffer{T}[],
+        ntuple(_ -> zeros(T, nnodes_q1), Val(Int(form.ncoefficients))))
+    plan = StaticSystem(
+        nx, ny, mesh.hx, mesh.hy, mesh.mesh_id, interior, cut, refresh, assemble)
+    return refresh_geometry!(plan, cutdata, aggregate_roots)
+end
+
+"""
+    restrict_solution!(u_m, system, u_full)
+
+Copy the master rows of a full-background solution into the compact projected
+solution vector. This is the left inverse of extension for vectors in the
+range of `system.refresh.E`.
+"""
+function restrict_solution!(u_m::AbstractVector, plan::StaticSystem,
+                            u_full::AbstractVector)
+    rows = plan.refresh.master_rows
+    length(u_m) == length(rows) || throw(DimensionMismatch("invalid master solution length"))
+    length(u_full) == size(plan.refresh.E, 1) ||
+        throw(DimensionMismatch("invalid background solution length"))
+    @inbounds for master in eachindex(rows)
+        u_m[master] = u_full[rows[master]]
+    end
+    return u_m
+end
+
+@inline function _assemble_cell!(
+    scratch::ThreadBuffer{T}, plan::StaticSystem{T}, cell::Int,
+    coefficients::NTuple{N,<:AbstractVector},
+) where {T,N}
+    r = plan.refresh
+    return _assemble_raw!(scratch.raw_matrix, scratch.raw_vector, r.element_tables,
+                          r.quadrature, r.coefficient_nodes, cell, coefficients)
+end
+
+@inline function _scatter_projected!(
+    plan::StaticSystem, scratch::ThreadBuffer, cell::Int,
+)
+    a = plan.assemble
+    test_dofs = a.test_cell_dofs[cell]
+    nt = length(test_dofs)
+    @inbounds for column in eachindex(test_dofs), row in eachindex(test_dofs)
+        slot = a.scatter_slots[cell][row + nt * (column - 1)]
+        a.B.nzval[slot] += scratch.effective_matrix[row, column]
+    end
+    @inbounds for row in eachindex(test_dofs)
+        a.b_m[test_dofs[row]] += scratch.effective_vector[row]
+    end
+    return nothing
+end
+
+function assemble_serial!(plan::StaticSystem, coefficients::NTuple{N,<:AbstractVector}) where {N}
+    a = plan.assemble
+    r = plan.refresh
+    fill!(a.B.nzval, zero(eltype(a.B)))
+    fill!(a.b_m, zero(eltype(a.b_m)))
+    scratch = a.thread_buffers[Threads.threadid()]
+    @inbounds for cell in 1:(plan.nx * plan.ny)
+        r.cell_states[cell] == OUT && continue
+        _assemble_cell!(scratch, plan, cell, coefficients)
+        _transform_agfem!(scratch, a.test_constraints[cell])
+        _scatter_projected!(plan, scratch, cell)
+    end
+    return a.B, a.b_m
+end
+
+function assemble_threaded!(plan::StaticSystem, coefficients::NTuple{N,<:AbstractVector}) where {N}
+    a = plan.assemble
+    r = plan.refresh
+    fill!(a.B.nzval, zero(eltype(a.B)))
+    fill!(a.b_m, zero(eltype(a.b_m)))
+    for color in a.colors
+        Threads.@threads :static for index in eachindex(color)
+            cell = Int(color[index])
+            r.cell_states[cell] == OUT && continue
+            scratch = a.thread_buffers[Threads.threadid()]
+            _assemble_cell!(scratch, plan, cell, coefficients)
+            _transform_agfem!(scratch, a.test_constraints[cell])
+            _scatter_projected!(plan, scratch, cell)
+        end
+    end
+    return a.B, a.b_m
+end
+
+"""
+    assemble!(system::StaticSystem, coefficients::NTuple{N,AbstractVector};
+              threaded=true)
+
+Assemble the projected operator `B = EᵀAE` (a real `n_m × n_m` sparse matrix)
+and the projected right-hand side `b_m = Eᵀb` from background-node coefficient
+arrays (one per element-table coefficient field). Coefficient fields are
+prolonged to the full lattice with the stored Q1 coefficient prolongation,
+then assembled.
+Returns `(B, b_m)`, both owned by the system and overwritten by the next call
+or invalidated by a structural `refresh_geometry!`.
+Solve with `cholesky(B)` or any solver on `B`; `diag(B)` is the diagonal
+preconditioner. Extend solutions with `system.refresh.E * u_m`.
+"""
+function assemble!(plan::StaticSystem,
+                   coefficients::NTuple{N,<:AbstractVector};
+                   threaded::Bool=true) where {N}
+    a = plan.assemble
+    P = plan.refresh.coefficient_prolongation
+    length(coefficients) == length(a.extended_coefficients) ||
+        throw(ArgumentError("element tables expect $(length(a.extended_coefficients)) coefficient fields, got $N"))
+    nnodes = size(P, 1)
+    all(length(values) == nnodes for values in coefficients) ||
+        throw(DimensionMismatch("coefficient vectors must contain one value per background node"))
+    for field in eachindex(a.extended_coefficients)
+        mul!(a.extended_coefficients[field], P, coefficients[field])
+    end
+    threaded ? assemble_threaded!(plan, a.extended_coefficients) :
+               assemble_serial!(plan, a.extended_coefficients)
+    return a.B, a.b_m
+end

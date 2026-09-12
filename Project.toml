@@ -1,0 +1,28 @@
+name = "StaticAssembler"
+uuid = "4D6BAC4E-E066-404E-8EC1-1925A1CACD63"
+version = "0.1.0"
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
+[weakdeps]
+Gridap = "56d4f2e9-7ea1-5844-9cf6-b9c51ca7ce8e"
+GridapEmbedded = "8838a6a3-0006-4405-b874-385995508d5d"
+
+[extensions]
+StaticAssemblerGridapExt = ["Gridap", "GridapEmbedded"]
+
+[compat]
+Gridap = "0.18, 0.19"
+GridapEmbedded = "0.9"
+julia = "1.11"
+
+[extras]
+Gridap = "56d4f2e9-7ea1-5844-9cf6-b9c51ca7ce8e"
+GridapEmbedded = "8838a6a3-0006-4405-b874-385995508d5d"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Random", "Test", "Gridap", "GridapEmbedded"]
