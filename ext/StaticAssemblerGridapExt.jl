@@ -13,7 +13,7 @@ using Gridap
 using GridapEmbedded
 using Gridap.Geometry: get_node_coordinates
 using StaticAssembler
-using StaticAssembler: Mesh, CutData
+using StaticAssembler: Mesh, CutData, BoundaryData
 
 const _T = Float64
 
@@ -22,7 +22,7 @@ const _T = Float64
 @assert IN == StaticAssembler.IN && GridapEmbedded.Interfaces.CUT == StaticAssembler.CUT &&
         OUT == StaticAssembler.OUT
 
-function _cut_geometry_data(cut_geometry, ::Type{T}) where {T}
+function _cut_geometry_data(cut_geometry, ::Type{T}; include_boundary::Bool=true) where {T}
     # GridapEmbedded has no public zero-copy subcell API. Keep its pinned
     # private layout dependency in this adapter and fail loudly if it drifts.
     @assert fieldnames(typeof(cut_geometry)) == (
@@ -30,10 +30,11 @@ function _cut_geometry_data(cut_geometry, ::Type{T}) where {T}
         :ls_to_subcell_to_inout, :subfacets, :ls_to_subfacet_to_inout,
         :oid_to_ls, :geo,
     )
-    bg_levels = getfield(cut_geometry, :ls_to_bgcell_to_inoutcut)
-    subcell_levels = getfield(cut_geometry, :ls_to_subcell_to_inout)
-    length(bg_levels) == 1 && length(subcell_levels) == 1 ||
-        throw(ArgumentError("direct quadrature refresh requires exactly one level set"))
+    geo = getfield(cut_geometry, :geo)
+    bg_states_composed = Vector{Int8}(
+        GridapEmbedded.Interfaces.compute_bgcell_to_inoutcut(cut_geometry, geo))
+    subcell_states_composed = Vector{Int8}(
+        GridapEmbedded.Interfaces.compute_subcell_to_inout(cut_geometry, geo))
 
     subcells = getfield(cut_geometry, :subcells)
     @assert fieldnames(typeof(subcells)) == (
@@ -41,15 +42,34 @@ function _cut_geometry_data(cut_geometry, ::Type{T}) where {T}
     cell_to_points = getfield(subcells, :cell_to_points)
     @assert fieldnames(typeof(cell_to_points)) == (:data, :ptrs)
     to_pairs(points) = map(p -> (T(p[1]), T(p[2])), points)
+    boundary_data = if include_boundary
+        subfacets = getfield(EmbeddedBoundary(cut_geometry), :subfacets)
+        @assert fieldnames(typeof(subfacets)) == (
+            :facet_to_points, :facet_to_normal, :facet_to_bgcell,
+            :point_to_coords, :point_to_rcoords)
+        facet_to_points = getfield(subfacets, :facet_to_points)
+        @assert fieldnames(typeof(facet_to_points)) == (:data, :ptrs)
+        BoundaryData{T}(
+            Vector{Int32}(getfield(subfacets, :facet_to_bgcell)),
+            Vector{Int32}(getfield(facet_to_points, :data)),
+            Vector{Int32}(getfield(facet_to_points, :ptrs)),
+            to_pairs(getfield(subfacets, :facet_to_normal)),
+            to_pairs(getfield(subfacets, :point_to_coords)),
+            to_pairs(getfield(subfacets, :point_to_rcoords)),
+        )
+    else
+        BoundaryData{T}()
+    end
     return CutData{T}(
         getfield(cut_geometry, :bgmodel),
-        Vector{Int8}(bg_levels[1]),
-        Vector{Int8}(subcell_levels[1]),
+        bg_states_composed,
+        subcell_states_composed,
         Vector{Int32}(getfield(subcells, :cell_to_bgcell)),
         Vector{Int32}(getfield(cell_to_points, :data)),
         Vector{Int32}(getfield(cell_to_points, :ptrs)),
         to_pairs(getfield(subcells, :point_to_coords)),
         to_pairs(getfield(subcells, :point_to_rcoords)),
+        boundary_data,
     )
 end
 
@@ -105,16 +125,22 @@ function StaticAssembler.StaticSystem(
     form,
     interior_quadrature=nothing,
     cut_quadrature=nothing,
+    boundary_quadrature=nothing,
 )
     mesh, cutdata = from_gridap(model, cut_geometry, nx, ny)
     return StaticAssembler.StaticSystem(
         mesh, cutdata, aggregate_roots;
-        form, interior_quadrature, cut_quadrature)
+        form, interior_quadrature, cut_quadrature, boundary_quadrature)
 end
 
 StaticAssembler.refresh_geometry!(plan::StaticAssembler.StaticSystem,
-                             cut_geometry, aggregate_roots) =
-    StaticAssembler.refresh_geometry!(plan, _cut_geometry_data(cut_geometry, _T),
-                                 aggregate_roots)
+                              cut_geometry, aggregate_roots) = begin
+    tables = plan.refresh.element_tables
+    include_boundary = !isempty(tables.boundary_bilinear) ||
+                       !isempty(tables.boundary_rhs)
+    StaticAssembler.refresh_geometry!(
+        plan, _cut_geometry_data(cut_geometry, _T; include_boundary),
+        aggregate_roots)
+end
 
 end # module

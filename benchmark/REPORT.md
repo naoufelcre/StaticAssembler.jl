@@ -137,6 +137,7 @@ Run from the package root:
 ```sh
 JULIA_NUM_THREADS=4 julia --project=. --startup-file=no benchmark/assembly.jl
 JULIA_NUM_THREADS=4 julia --project=. --startup-file=no benchmark/refresh.jl
+JULIA_NUM_THREADS=4 julia --project=. --startup-file=no benchmark/article.jl
 JULIA_NUM_THREADS=4 julia --project=. --startup-file=no benchmark/profile_refresh.jl 128 1
 ```
 

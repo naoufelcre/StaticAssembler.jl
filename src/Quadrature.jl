@@ -16,6 +16,178 @@ mutable struct CutQuadratureStaging{T}
     weight::Vector{T}
 end
 
+mutable struct BoundaryQuadrature{T}
+    pointers::Vector{Int}
+    facet::Vector{Int32}
+    reference_r::Vector{T}
+    reference_s::Vector{T}
+    weight::Vector{T}
+    normal_x::Vector{T}
+    normal_y::Vector{T}
+    nfacets::Int
+end
+
+mutable struct BoundaryQuadratureStaging{T}
+    pointers::Vector{Int}
+    facet::Vector{Int32}
+    reference_r::Vector{T}
+    reference_s::Vector{T}
+    weight::Vector{T}
+    normal_x::Vector{T}
+    normal_y::Vector{T}
+    nfacets::Int
+end
+
+function _validate_and_size_boundary_staging!(
+    staging::BoundaryQuadratureStaging{T}, boundary::BoundaryData{T},
+    bg_states, nx::Int, ny::Int, hx::T, hy::T,
+    rule::_ReferenceQuadrature{1,T},
+) where {T}
+    ncells = nx * ny
+    nfacets = length(boundary.facet_to_bgcell)
+    point_ids = boundary.point_ids
+    point_pointers = boundary.point_pointers
+    physical_points = boundary.physical_points
+    reference_points = boundary.reference_points
+    normals = boundary.normals
+    length(staging.pointers) == ncells + 1 ||
+        error("boundary quadrature staging pointer count changed")
+    length(bg_states) == ncells ||
+        throw(ArgumentError("boundary cell states do not match the background mesh"))
+    length(normals) == nfacets ||
+        throw(ArgumentError("boundary normal count is inconsistent"))
+    length(point_pointers) == nfacets + 1 && point_pointers[1] == 1 &&
+        point_pointers[end] == length(point_ids) + 1 ||
+        throw(ArgumentError("boundary connectivity pointers are inconsistent"))
+    length(reference_points) == length(physical_points) ||
+        throw(ArgumentError("boundary reference and physical point counts differ"))
+
+    reference_tolerance = T(256) * eps(T)
+    length_tolerance = T(512) * eps(T) * max(hx, hy)
+    counts = staging.pointers
+    fill!(counts, 0)
+    previous_bg_cell = 0
+    nrule = length(rule.points)
+    for facet in 1:nfacets
+        bg_cell = Int(boundary.facet_to_bgcell[facet])
+        1 <= bg_cell <= ncells ||
+            throw(ArgumentError("boundary facet references an invalid background cell"))
+        bg_cell >= previous_bg_cell ||
+            throw(ArgumentError("boundary facets are not grouped in background-cell order"))
+        bg_states[bg_cell] == CUT ||
+            throw(ArgumentError("boundary facet is attached to an uncut background cell"))
+        previous_bg_cell = bg_cell
+
+        first_point = Int(point_pointers[facet])
+        next_point = Int(point_pointers[facet + 1])
+        next_point == first_point + 2 ||
+            throw(ArgumentError("direct boundary quadrature requires line segments"))
+        first_point >= 1 && next_point - 1 <= length(point_ids) ||
+            throw(ArgumentError("boundary connectivity is out of bounds"))
+        point1 = Int(point_ids[first_point])
+        point2 = Int(point_ids[first_point + 1])
+        1 <= point1 <= length(reference_points) &&
+            1 <= point2 <= length(reference_points) ||
+            throw(ArgumentError("boundary point ID is out of bounds"))
+
+        r1, r2 = reference_points[point1], reference_points[point2]
+        x1, x2 = physical_points[point1], physical_points[point2]
+        r, s = T(r1[1]), T(r1[2])
+        u, v = T(r2[1]), T(r2[2])
+        x, y = T(x1[1]), T(x1[2])
+        z, w = T(x2[1]), T(x2[2])
+        all(isfinite, (r, s, u, v, x, y, z, w)) ||
+            throw(ArgumentError("boundary geometry contains non-finite point data"))
+        all(q -> -reference_tolerance <= q <= one(T) + reference_tolerance,
+            (r, s, u, v)) ||
+            throw(ArgumentError("boundary point lies outside its background reference cell"))
+        _metric_matches(z - x, u - r, hx) &&
+            _metric_matches(w - y, v - s, hy) ||
+            throw(ArgumentError("boundary coordinates disagree with background mesh metrics"))
+
+        segment_length = hypot(z - x, w - y)
+        segment_length <= length_tolerance && continue
+        normal = normals[facet]
+        normal_x, normal_y = T(normal[1]), T(normal[2])
+        isfinite(normal_x) && isfinite(normal_y) ||
+            throw(ArgumentError("boundary geometry contains a non-finite normal"))
+        hypot(normal_x, normal_y) > reference_tolerance ||
+            throw(ArgumentError("non-degenerate boundary facet has a zero normal"))
+        counts[bg_cell + 1] += nrule
+    end
+
+    counts[1] = 1
+    for cell in 1:ncells
+        counts[cell + 1] += counts[cell]
+    end
+    npoints = counts[end] - 1
+    for values in (staging.facet, staging.reference_r, staging.reference_s,
+                   staging.weight, staging.normal_x, staging.normal_y)
+        length(values) < npoints && resize!(values, npoints)
+    end
+    staging.nfacets = nfacets
+    return npoints
+end
+
+function _stage_boundary_quadrature!(
+    staging::BoundaryQuadratureStaging{T}, boundary::BoundaryData{T},
+    bg_states, nx::Int, ny::Int, hx::T, hy::T,
+    rule::_ReferenceQuadrature{1,T},
+) where {T}
+    npoints = _validate_and_size_boundary_staging!(
+        staging, boundary, bg_states, nx, ny, hx, hy, rule)
+    length_tolerance = T(512) * eps(T) * max(hx, hy)
+    q = 1
+    for facet in eachindex(boundary.facet_to_bgcell)
+        first_point = Int(boundary.point_pointers[facet])
+        point1 = Int(boundary.point_ids[first_point])
+        point2 = Int(boundary.point_ids[first_point + 1])
+        r1, r2 = boundary.reference_points[point1], boundary.reference_points[point2]
+        x1, x2 = boundary.physical_points[point1], boundary.physical_points[point2]
+        segment_length = T(hypot(x2[1] - x1[1], x2[2] - x1[2]))
+        segment_length <= length_tolerance && continue
+        normal = boundary.normals[facet]
+        normal_length = T(hypot(normal[1], normal[2]))
+        normal_x = T(normal[1]) / normal_length
+        normal_y = T(normal[2]) / normal_length
+        @inbounds for k in eachindex(rule.points, rule.weights)
+            t = rule.points[k][1]
+            staging.facet[q] = Int32(facet)
+            staging.reference_r[q] = (one(T) - t) * T(r1[1]) + t * T(r2[1])
+            staging.reference_s[q] = (one(T) - t) * T(r1[2]) + t * T(r2[2])
+            staging.weight[q] = segment_length * rule.weights[k]
+            staging.normal_x[q] = normal_x
+            staging.normal_y[q] = normal_y
+            q += 1
+        end
+    end
+    @assert q == npoints + 1
+    return npoints
+end
+
+function _commit_boundary_quadrature!(
+    destination::BoundaryQuadrature, staging::BoundaryQuadratureStaging,
+    npoints::Int,
+)
+    length(destination.pointers) == length(staging.pointers) ||
+        error("boundary quadrature pointer count changed during commit")
+    resize!(destination.facet, npoints)
+    resize!(destination.reference_r, npoints)
+    resize!(destination.reference_s, npoints)
+    resize!(destination.weight, npoints)
+    resize!(destination.normal_x, npoints)
+    resize!(destination.normal_y, npoints)
+    copyto!(destination.pointers, staging.pointers)
+    copyto!(destination.facet, 1, staging.facet, 1, npoints)
+    copyto!(destination.reference_r, 1, staging.reference_r, 1, npoints)
+    copyto!(destination.reference_s, 1, staging.reference_s, 1, npoints)
+    copyto!(destination.weight, 1, staging.weight, 1, npoints)
+    copyto!(destination.normal_x, 1, staging.normal_x, 1, npoints)
+    copyto!(destination.normal_y, 1, staging.normal_y, 1, npoints)
+    destination.nfacets = staging.nfacets
+    return destination
+end
+
 function _validate_and_size_staging!(
     staging::CutQuadratureStaging{T}, active_bg_cells, cutdata::CutData{T},
     nx::Int, ny::Int, hx::T, hy::T, rule::_ReferenceQuadrature{3,T},

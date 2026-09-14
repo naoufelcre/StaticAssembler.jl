@@ -20,7 +20,8 @@
 
 """
     StaticSystem(mesh, cutdata, aggregate_roots;
-                 form, interior_quadrature=nothing, cut_quadrature=nothing)
+                 form, interior_quadrature=nothing, cut_quadrature=nothing,
+                 boundary_quadrature=nothing)
 
 Master-only projected AgFEM system. `mesh` and `cutdata` are the
 background triangulation and cut-triangulation descriptors (see
@@ -34,22 +35,28 @@ aggregate-root changes on `refresh_geometry!`.
 
 `interior_quadrature` supplies `(r,s)` points on `[0,1]²` and normalized
 weights; `cut_quadrature` supplies barycentric triangle points and normalized
-weights. Each accepts a `(points, weights)` pair or an object exposing
+weights; `boundary_quadrature` supplies points on `[0,1]` and normalized
+weights for each embedded segment. Each accepts a `(points, weights)` pair or an object exposing
 `points` and `weights`. `nothing` selects the dominant element's conservative
 default. Rules are validated and copied once; geometry refresh only remaps the
 cached cut rule. The defaults integrate test/trial basis products multiplied by
-a Q1 coefficient; nonlinear `StateFunction`s may require higher-order rules.
+a Q1 coefficient, upgraded to the Q2 rule when any coefficient field uses Q2;
+nonlinear `StateFunction`s may require higher-order rules.
 """
 struct RefreshCache{T,LK}
     element_tables::LK
     quadrature::CutQuadrature{T}
     quadrature_buffer::CutQuadratureStaging{T}
+    boundary_quadrature::BoundaryQuadrature{T}
+    boundary_quadrature_buffer::BoundaryQuadratureStaging{T}
     cell_states::Vector{Int8}
     last_roots::Vector{Int32}
     E::SparseMatrixCSC{T,Int}
     master_rows::Vector{Int}
     coefficient_prolongation::SparseMatrixCSC{T,Int}
     coefficient_nodes::Matrix{Int32}
+    q2_coefficient_prolongation::SparseMatrixCSC{T,Int}
+    q2_coefficient_nodes::Matrix{Int32}
 end
 
 struct AssembleCache{T,N,MT}
@@ -72,6 +79,7 @@ mutable struct StaticSystem{T,N,LK,MT}
     mesh_id::Any
     interior_quadrature::_ReferenceQuadrature{2,T}
     cut_quadrature::_ReferenceQuadrature{3,T}
+    boundary_rule::_ReferenceQuadrature{1,T}
     refresh::RefreshCache{T,LK}
     assemble::AssembleCache{T,N,MT}
 end
@@ -184,10 +192,32 @@ end
 
 # Structural refresh core: build transient factored E rows per block, number
 # the compact master DOFs block-major, fill the per-cell C tables in place,
-# and materialize E (solution prolongation) and the Q1 coefficient
-# prolongation as sparse matrices. Same math as the previous stored tables;
+# and materialize E (solution prolongation) and the Q1/Q2 coefficient
+# prolongations as sparse matrices. Same math as the previous stored tables;
 # only the storage changed.
+function _coefficient_extension(::Type{T}, element::ReferenceFiniteElement,
+                                bg_states, aggregate_roots,
+                                nx::Int, ny::Int) where {T}
+    nnodes = node_grid(element, nx) * node_grid(element, ny)
+    count = zeros(UInt8, nnodes)
+    nodes = zeros(Int32, nnode(element), nnodes)
+    weights = zeros(T, nnode(element), nnodes)
+    _extension_row_supports!(count, nodes, weights, falses(nnodes),
+                             zeros(Int32, nnodes), element,
+                             bg_states, aggregate_roots, nx, ny)
+    I = Int[]
+    J = Int[]
+    V = T[]
+    for node in 1:nnodes, support in 1:Int(count[node])
+        push!(I, node)
+        push!(J, Int(nodes[support, node]))
+        push!(V, weights[support, node])
+    end
+    return sparse(I, J, V, nnodes, nnodes)
+end
+
 function _refresh_static_tables!(::Type{T}, cell_dofs, constraints, spaces,
+                                  coefficient_elements,
                                   bg_states, aggregate_roots, nx::Int,
                                   ny::Int) where {T}
     nblocks = length(spaces)
@@ -250,22 +280,13 @@ function _refresh_static_tables!(::Type{T}, cell_dofs, constraints, spaces,
     end
     E = sparse(I, J, V, n_bg, n_m)
 
-    nnodes_q1 = (nx + 1) * (ny + 1)
-    qcount = zeros(UInt8, nnodes_q1)
-    qnodes = zeros(Int32, 4, nnodes_q1)
-    qweights = zeros(T, 4, nnodes_q1)
-    _extension_row_supports!(qcount, qnodes, qweights, falses(nnodes_q1),
-                             zeros(Int32, nnodes_q1), Q1ReferenceQuadrilateral(),
-                             bg_states, aggregate_roots, nx, ny)
-    Iq = Int[]
-    Jq = Int[]
-    Vq = T[]
-    for node in 1:nnodes_q1, support in 1:Int(qcount[node])
-        push!(Iq, node)
-        push!(Jq, Int(qnodes[support, node]))
-        push!(Vq, qweights[support, node])
-    end
-    P = sparse(Iq, Jq, Vq, nnodes_q1, nnodes_q1)
+    P = _coefficient_extension(
+        T, Q1ReferenceQuadrilateral(), bg_states, aggregate_roots, nx, ny)
+    P2 = any(element -> element isa Q2ReferenceQuadrilateral,
+             coefficient_elements) ?
+        _coefficient_extension(
+            T, Q2ReferenceQuadrilateral(), bg_states, aggregate_roots, nx, ny) :
+        spzeros(T, 0, 0)
 
     # Per-cell effective (master) DOFs and raw→effective constraint matrices.
     # `C[eff_local, raw_local]` is the weight with which raw local DOF
@@ -340,7 +361,7 @@ function _refresh_static_tables!(::Type{T}, cell_dofs, constraints, spaces,
         end
         constraints[cell] = C
     end
-    return E, master_rows, P
+    return E, master_rows, P, P2
 end
 
 # B sparse pattern from the per-cell effective DOF connectivity.
@@ -413,47 +434,77 @@ function refresh_geometry!(plan::StaticSystem{T}, cutdata::CutData{T},
         r.quadrature_buffer, background_cells, cutdata,
         plan.nx, plan.ny, plan.hx, plan.hy,
         plan.cut_quadrature)
-    _commit_quadrature!(
-        r.quadrature, r.quadrature_buffer.pointers,
-        r.quadrature_buffer.is_cut,
-        r.quadrature_buffer.reference_r, r.quadrature_buffer.reference_s,
-        r.quadrature_buffer.weight, npoints)
-    @inbounds for cell in 1:ncells
-        state = bg_states[cell]
-        r.cell_states[cell] = state
-        r.last_roots[cell] = state == OUT ? Int32(0) : Int32(roots[cell])
-        r.quadrature.is_cut[cell] = state != IN
+    has_boundary = !isempty(r.element_tables.boundary_bilinear) ||
+                   !isempty(r.element_tables.boundary_rhs)
+    boundary_npoints = if has_boundary
+        staged_boundary = _stage_boundary_quadrature!(
+            r.boundary_quadrature_buffer, cutdata.boundary, bg_states,
+            plan.nx, plan.ny, plan.hx, plan.hy, plan.boundary_rule)
+        if r.boundary_quadrature_buffer.nfacets == 0 && any(==(CUT), bg_states)
+            throw(ArgumentError("boundary-enabled form requires embedded boundary facets for cut cells"))
+        end
+        staged_boundary
+    else
+        fill!(r.boundary_quadrature_buffer.pointers, 1)
+        r.boundary_quadrature_buffer.nfacets = 0
+        0
     end
+    # Structural rebuilds use fresh tables so a late failure throws before
+    # any committed cache is touched; the swap below only runs on success.
+    # ponytail: fresh B pattern per structural refresh; reuse it only if profiling blames this path.
     if structural
-        E, master_rows, P = _refresh_static_tables!(
-            T, a.test_cell_dofs, a.test_constraints, spaces, bg_states, roots,
+        new_cell_dofs = Vector{Vector{Int32}}()
+        new_constraints = Vector{Matrix{T}}()
+        E, master_rows, P, P2 = _refresh_static_tables!(
+            T, new_cell_dofs, new_constraints, spaces,
+            r.element_tables.coefficient_elements, bg_states, roots,
             plan.nx, plan.ny)
         n_m = size(E, 2)
+        pattern_rows = Vector{Vector{Int}}()
         B = _pattern_from_ragged_dofs!(
-            a.B, a.pattern_rows, a.test_cell_dofs, a.test_cell_dofs, n_m, n_m)
+            spzeros(T, 0, 0), pattern_rows, new_cell_dofs, new_cell_dofs, n_m, n_m)
         slots = _ragged_scatter_slots!(
-            a.scatter_slots, B, a.test_cell_dofs, a.test_cell_dofs)
-        validate_sparse_slots(B, a.test_cell_dofs, a.test_cell_dofs, slots)
-        colors = _effective_cell_colors(a.test_cell_dofs, a.test_cell_dofs)
-        max_test = maximum(length, a.test_cell_dofs; init=0)
+            Vector{Vector{Int}}(), B, new_cell_dofs, new_cell_dofs)
+        validate_sparse_slots(B, new_cell_dofs, new_cell_dofs, slots)
+        colors = _effective_cell_colors(new_cell_dofs, new_cell_dofs)
+        max_test = maximum(length, new_cell_dofs; init=0)
         ntest_raw = sum(ndofs(space) for space in spaces)
         buffers = [ThreadBuffer(
             zeros(T, ntest_raw, ntest_raw), zeros(T, ntest_raw),
             zeros(T, max_test, ntest_raw),
             zeros(T, max_test, max_test), zeros(T, max_test),
         ) for _ in 1:Threads.maxthreadid()]
-        resize!(a.b_m, n_m)
-        fill!(a.b_m, zero(T))
+        b_m = zeros(T, n_m)
         plan.refresh = RefreshCache(r.element_tables, r.quadrature, r.quadrature_buffer,
+                                    r.boundary_quadrature,
+                                    r.boundary_quadrature_buffer,
                                     r.cell_states, r.last_roots, E, master_rows, P,
-                                    r.coefficient_nodes)
-        plan.assemble = AssembleCache(B, a.b_m, a.test_cell_dofs, a.test_constraints,
-                                      slots, a.pattern_rows, colors, buffers,
+                                    r.coefficient_nodes, P2,
+                                    r.q2_coefficient_nodes)
+        plan.assemble = AssembleCache(B, b_m, new_cell_dofs, new_constraints,
+                                      slots, pattern_rows, colors, buffers,
                                       a.extended_coefficients)
+        r = plan.refresh
+        a = plan.assemble
+    end
+    _commit_quadrature!(
+        r.quadrature, r.quadrature_buffer.pointers,
+        r.quadrature_buffer.is_cut,
+        r.quadrature_buffer.reference_r, r.quadrature_buffer.reference_s,
+        r.quadrature_buffer.weight, npoints)
+    _commit_boundary_quadrature!(
+        r.boundary_quadrature, r.boundary_quadrature_buffer, boundary_npoints)
+    @inbounds for cell in 1:ncells
+        state = bg_states[cell]
+        r.cell_states[cell] = state
+        r.last_roots[cell] = state == OUT ? Int32(0) : Int32(roots[cell])
+        r.quadrature.is_cut[cell] = state != IN
     end
     _regenerate_element_tables!(plan.refresh.element_tables, plan.hx, plan.hy,
                                  plan.refresh.quadrature, plan.nx * plan.ny,
                                  plan.interior_quadrature)
+    _regenerate_boundary_tables!(plan.refresh.element_tables, plan.hx, plan.hy,
+                                 plan.refresh.boundary_quadrature)
     return plan
 end
 
@@ -485,10 +536,13 @@ function StaticSystem(
     form::ElementVariationalForm,
     interior_quadrature=nothing,
     cut_quadrature=nothing,
+    boundary_quadrature=nothing,
 ) where {T<:AbstractFloat}
     T === Float64 || throw(ArgumentError("the projected path requires Float64"))
     form.ncoefficients >= 0 ||
         throw(ArgumentError("form.ncoefficients must be nonnegative"))
+    form.nfacetfields >= 0 ||
+        throw(ArgumentError("form.nfacetfields must be nonnegative"))
     form.test_space == form.trial_space ||
         throw(ArgumentError("the projected path requires identical test and trial spaces"))
     nx = mesh.nx
@@ -500,32 +554,51 @@ function StaticSystem(
         throw(ArgumentError("background grid metrics must be finite and positive"))
 
     ncells = nx * ny
-    element = _dominant_element(form.test_space, form.trial_space)
+    element = _rule_element(form.test_space, form.trial_space,
+                            form.coefficient_elements)
     interior_source = isnothing(interior_quadrature) ?
         interior_rule(element) : interior_quadrature
     cut_source = isnothing(cut_quadrature) ? cut_rule(element) : cut_quadrature
+    boundary_source = isnothing(boundary_quadrature) ?
+        boundary_rule(element) : boundary_quadrature
     interior = _canonical_quadrature(
         interior_source, Val(2), T, "interior quadrature")
     cut = _canonical_quadrature(cut_source, Val(3), T, "cut quadrature")
+    boundary = _canonical_quadrature(
+        boundary_source, Val(1), T, "boundary quadrature")
     element_tables = generate_element_tables(
         form, mesh.hx, mesh.hy, nothing, ncells, interior)
     quadrature = CutQuadrature(
         Vector{Int}(undef, ncells + 1), falses(ncells), T[], T[], T[])
     staging = CutQuadratureStaging(
         Vector{Int}(undef, ncells + 1), falses(ncells), T[], T[], T[])
-    nnodes_q1 = (nx + 1) * (ny + 1)
+    boundary_points = BoundaryQuadrature(
+        Vector{Int}(undef, ncells + 1), Int32[], T[], T[], T[], T[], T[], 0)
+    boundary_staging = BoundaryQuadratureStaging(
+        Vector{Int}(undef, ncells + 1), Int32[], T[], T[], T[], T[], T[], 0)
+    has_q2_coefficients = any(
+        element -> element isa Q2ReferenceQuadrilateral,
+        form.coefficient_elements)
+    q2_coefficient_nodes = has_q2_coefficients ?
+        _cell_nodes(Q2ReferenceQuadrilateral(), Int32.(1:ncells), nx) :
+        Matrix{Int32}(undef, 0, 0)
     refresh = RefreshCache(
-        element_tables, quadrature, staging,
+        element_tables, quadrature, staging, boundary_points, boundary_staging,
         zeros(Int8, ncells), zeros(Int32, ncells),
         spzeros(T, 0, 0), Int[], spzeros(T, 0, 0),
-        _cell_nodes(Q1ReferenceQuadrilateral(), Int32.(1:ncells), nx))
+        _cell_nodes(Q1ReferenceQuadrilateral(), Int32.(1:ncells), nx),
+        spzeros(T, 0, 0), q2_coefficient_nodes)
     assemble = AssembleCache(
         spzeros(T, 0, 0), T[],
         Vector{Vector{Int32}}(), Vector{Matrix{T}}(), Vector{Vector{Int}}(),
         Vector{Vector{Int}}(), Vector{Vector{Int32}}(), ThreadBuffer{T}[],
-        ntuple(_ -> zeros(T, nnodes_q1), Val(Int(form.ncoefficients))))
+        ntuple(Val(Int(form.ncoefficients))) do field
+            element = form.coefficient_elements[field]
+            zeros(T, node_grid(element, nx) * node_grid(element, ny))
+        end)
     plan = StaticSystem(
-        nx, ny, mesh.hx, mesh.hy, mesh.mesh_id, interior, cut, refresh, assemble)
+        nx, ny, mesh.hx, mesh.hy, mesh.mesh_id,
+        interior, cut, boundary, refresh, assemble)
     return refresh_geometry!(plan, cutdata, aggregate_roots)
 end
 
@@ -550,11 +623,14 @@ end
 
 @inline function _assemble_cell!(
     scratch::ThreadBuffer{T}, plan::StaticSystem{T}, cell::Int,
-    coefficients::NTuple{N,<:AbstractVector},
-) where {T,N}
+    coefficients::NTuple{N,AbstractVector},
+    facet_fields::NTuple{M,AbstractVector},
+) where {T,N,M}
     r = plan.refresh
     return _assemble_raw!(scratch.raw_matrix, scratch.raw_vector, r.element_tables,
-                          r.quadrature, r.coefficient_nodes, cell, coefficients)
+                           r.quadrature, r.boundary_quadrature,
+                           r.coefficient_nodes, r.q2_coefficient_nodes,
+                           cell, coefficients, facet_fields)
 end
 
 @inline function _scatter_projected!(
@@ -573,7 +649,9 @@ end
     return nothing
 end
 
-function assemble_serial!(plan::StaticSystem, coefficients::NTuple{N,<:AbstractVector}) where {N}
+function assemble_serial!(plan::StaticSystem,
+                          coefficients::NTuple{N,AbstractVector},
+                          facet_fields::NTuple{M,AbstractVector}) where {N,M}
     a = plan.assemble
     r = plan.refresh
     fill!(a.B.nzval, zero(eltype(a.B)))
@@ -581,14 +659,16 @@ function assemble_serial!(plan::StaticSystem, coefficients::NTuple{N,<:AbstractV
     scratch = a.thread_buffers[Threads.threadid()]
     @inbounds for cell in 1:(plan.nx * plan.ny)
         r.cell_states[cell] == OUT && continue
-        _assemble_cell!(scratch, plan, cell, coefficients)
+        _assemble_cell!(scratch, plan, cell, coefficients, facet_fields)
         _transform_agfem!(scratch, a.test_constraints[cell])
         _scatter_projected!(plan, scratch, cell)
     end
     return a.B, a.b_m
 end
 
-function assemble_threaded!(plan::StaticSystem, coefficients::NTuple{N,<:AbstractVector}) where {N}
+function assemble_threaded!(plan::StaticSystem,
+                            coefficients::NTuple{N,AbstractVector},
+                            facet_fields::NTuple{M,AbstractVector}) where {N,M}
     a = plan.assemble
     r = plan.refresh
     fill!(a.B.nzval, zero(eltype(a.B)))
@@ -598,7 +678,7 @@ function assemble_threaded!(plan::StaticSystem, coefficients::NTuple{N,<:Abstrac
             cell = Int(color[index])
             r.cell_states[cell] == OUT && continue
             scratch = a.thread_buffers[Threads.threadid()]
-            _assemble_cell!(scratch, plan, cell, coefficients)
+            _assemble_cell!(scratch, plan, cell, coefficients, facet_fields)
             _transform_agfem!(scratch, a.test_constraints[cell])
             _scatter_projected!(plan, scratch, cell)
         end
@@ -608,32 +688,45 @@ end
 
 """
     assemble!(system::StaticSystem, coefficients::NTuple{N,AbstractVector};
-              threaded=true)
+              facet_fields=(), threaded=true)
 
 Assemble the projected operator `B = EᵀAE` (a real `n_m × n_m` sparse matrix)
 and the projected right-hand side `b_m = Eᵀb` from background-node coefficient
 arrays (one per element-table coefficient field). Coefficient fields are
 prolonged to the full lattice with the stored Q1 coefficient prolongation,
-then assembled.
+then assembled. `facet_fields` is a tuple of arrays in the current embedded
+boundary facet order; these values are not prolonged.
 Returns `(B, b_m)`, both owned by the system and overwritten by the next call
 or invalidated by a structural `refresh_geometry!`.
 Solve with `cholesky(B)` or any solver on `B`; `diag(B)` is the diagonal
 preconditioner. Extend solutions with `system.refresh.E * u_m`.
 """
 function assemble!(plan::StaticSystem,
-                   coefficients::NTuple{N,<:AbstractVector};
+                   coefficients::NTuple{N,AbstractVector};
+                   facet_fields=(),
                    threaded::Bool=true) where {N}
     a = plan.assemble
-    P = plan.refresh.coefficient_prolongation
+    r = plan.refresh
     length(coefficients) == length(a.extended_coefficients) ||
         throw(ArgumentError("element tables expect $(length(a.extended_coefficients)) coefficient fields, got $N"))
-    nnodes = size(P, 1)
-    all(length(values) == nnodes for values in coefficients) ||
-        throw(DimensionMismatch("coefficient vectors must contain one value per background node"))
+    facet_fields isa Tuple && all(values -> values isa AbstractVector, facet_fields) ||
+        throw(ArgumentError("facet_fields must be a tuple of vectors"))
+    expected_facet_fields = plan.refresh.element_tables.nfacetfields
+    length(facet_fields) == expected_facet_fields ||
+        throw(ArgumentError("element tables expect $expected_facet_fields facet fields, got $(length(facet_fields))"))
+    nfacets = plan.refresh.boundary_quadrature.nfacets
+    all(length(values) == nfacets for values in facet_fields) ||
+        throw(DimensionMismatch("facet fields must contain one value per embedded boundary facet"))
     for field in eachindex(a.extended_coefficients)
+        element = r.element_tables.coefficient_elements[field]
+        P = element isa Q1ReferenceQuadrilateral ?
+            r.coefficient_prolongation : r.q2_coefficient_prolongation
+        length(coefficients[field]) == size(P, 1) ||
+            throw(DimensionMismatch(
+                "coefficient field $field has the wrong background-node count"))
         mul!(a.extended_coefficients[field], P, coefficients[field])
     end
-    threaded ? assemble_threaded!(plan, a.extended_coefficients) :
-               assemble_serial!(plan, a.extended_coefficients)
+    threaded ? assemble_threaded!(plan, a.extended_coefficients, facet_fields) :
+               assemble_serial!(plan, a.extended_coefficients, facet_fields)
     return a.B, a.b_m
 end

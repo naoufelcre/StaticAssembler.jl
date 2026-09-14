@@ -42,37 +42,100 @@ end
 # (Ciarlet `A^K` / `F^K`) from the element tables and the cut quadrature of
 # `cell`. Shared by the projected `StaticSystem` (which reuses the raw block
 # before projecting it).
-@inline function _assemble_raw!(Ke, fe, kd, quadrature, coefficient_nodes,
-                                cell::Int, coefficients::NTuple{N,<:AbstractVector}) where {N}
+@inline function _assemble_raw!(Ke, fe, kd, quadrature, boundary_quadrature,
+                                 coefficient_nodes, q2_coefficient_nodes, cell::Int,
+                                 coefficients::NTuple{N,AbstractVector},
+                                 facet_fields::NTuple{M,AbstractVector}) where {N,M}
     T = eltype(Ke)
     fill!(Ke, zero(T))
     fill!(fe, zero(T))
+    point_context = kd.coefficient_gradients
+    has_q2 = _has_q2_elements(typeof(kd.coefficient_elements))
     if quadrature.pointers[cell] == quadrature.pointers[cell + 1]
-        quadrature.is_cut[cell] && return nothing
-        copyto!(Ke, kd.const_interior)
-        @inbounds for q in eachindex(kd.interior_weight)
-            sh_t, gx_t, gy_t, sh_c, gx_c, gy_c = _point_bases(
-                kd.interior_shape_t, kd.interior_gx_t, kd.interior_gy_t,
-                kd.interior_shape_c, kd.interior_gx_c, kd.interior_gy_c,
-                q, kd.test_space, kd.trial_space)
-            csh = _packed4(kd.interior_coefficient_shape, q)
-            c = _background_coefficients(csh, coefficient_nodes, cell, coefficients)
-            _accumulate_point!(kd, Ke, fe, sh_t, gx_t, gy_t, sh_c, gx_c, gy_c, c,
-                               kd.interior_weight[q])
+        if !quadrature.is_cut[cell]
+            copyto!(Ke, kd.const_interior)
+            @inbounds for q in eachindex(kd.interior_weight)
+                sh_t, gx_t, gy_t, sh_c, gx_c, gy_c = _point_bases(
+                    kd.interior_shape_t, kd.interior_gx_t, kd.interior_gy_t,
+                    kd.interior_shape_c, kd.interior_gx_c, kd.interior_gy_c,
+                    q, kd.test_space, kd.trial_space)
+                csh = _packed4(kd.interior_coefficient_shape, q)
+                q2sh = _maybe_q2_basis(
+                    Val(has_q2), kd.interior_q2_coefficient_shape, q)
+                c = if point_context
+                    q2gx = _maybe_q2_basis(
+                        Val(has_q2), kd.interior_q2_coefficient_gx, q)
+                    q2gy = _maybe_q2_basis(
+                        Val(has_q2), kd.interior_q2_coefficient_gy, q)
+                    _coefficient_point(
+                        csh, _packed4(kd.interior_coefficient_gx, q),
+                        _packed4(kd.interior_coefficient_gy, q),
+                        q2sh, q2gx, q2gy, coefficient_nodes, q2_coefficient_nodes,
+                        cell, coefficients, kd.coefficient_elements)
+                else
+                    _coefficient_values(
+                        csh, q2sh, coefficient_nodes, q2_coefficient_nodes,
+                        cell, coefficients, kd.coefficient_elements)
+                end
+                _accumulate_point!(kd, Ke, fe, sh_t, gx_t, gy_t, sh_c, gx_c, gy_c, c,
+                                   kd.interior_weight[q])
+            end
         end
-        return nothing
+    else
+        copyto!(Ke, kd.const_cut[kd.cut_cell_index[cell]])
+        @inbounds for q in quadrature.pointers[cell]:(quadrature.pointers[cell + 1] - 1)
+            sh_t, gx_t, gy_t, sh_c, gx_c, gy_c = _point_bases(
+                kd.cut_shape_t, kd.cut_gx_t, kd.cut_gy_t,
+                kd.cut_shape_c, kd.cut_gx_c, kd.cut_gy_c,
+                q, kd.test_space, kd.trial_space)
+            csh = _packed4(kd.cut_coefficient_shape, q)
+            q2sh = _maybe_q2_basis(
+                Val(has_q2), kd.cut_q2_coefficient_shape, q)
+            c = if point_context
+                q2gx = _maybe_q2_basis(
+                    Val(has_q2), kd.cut_q2_coefficient_gx, q)
+                q2gy = _maybe_q2_basis(
+                    Val(has_q2), kd.cut_q2_coefficient_gy, q)
+                _coefficient_point(
+                    csh, _packed4(kd.cut_coefficient_gx, q),
+                    _packed4(kd.cut_coefficient_gy, q), q2sh, q2gx, q2gy,
+                    coefficient_nodes, q2_coefficient_nodes, cell,
+                    coefficients, kd.coefficient_elements)
+            else
+                _coefficient_values(
+                    csh, q2sh, coefficient_nodes, q2_coefficient_nodes,
+                    cell, coefficients, kd.coefficient_elements)
+            end
+            _accumulate_point!(kd, Ke, fe, sh_t, gx_t, gy_t, sh_c, gx_c, gy_c, c,
+                               quadrature.weight[q])
+        end
     end
 
-    copyto!(Ke, kd.const_cut[kd.cut_cell_index[cell]])
-    @inbounds for q in quadrature.pointers[cell]:(quadrature.pointers[cell + 1] - 1)
+    tables = kd.boundary
+    @inbounds for q in boundary_quadrature.pointers[cell]:(boundary_quadrature.pointers[cell + 1] - 1)
         sh_t, gx_t, gy_t, sh_c, gx_c, gy_c = _point_bases(
-            kd.cut_shape_t, kd.cut_gx_t, kd.cut_gy_t,
-            kd.cut_shape_c, kd.cut_gx_c, kd.cut_gy_c,
+            tables.shape_t, tables.gx_t, tables.gy_t,
+            tables.shape_c, tables.gx_c, tables.gy_c,
             q, kd.test_space, kd.trial_space)
-        csh = _packed4(kd.cut_coefficient_shape, q)
-        c = _background_coefficients(csh, coefficient_nodes, cell, coefficients)
-        _accumulate_point!(kd, Ke, fe, sh_t, gx_t, gy_t, sh_c, gx_c, gy_c, c,
-                           quadrature.weight[q])
+        q2sh = _maybe_q2_basis(
+            Val(has_q2), tables.q2_coefficient_shape, q)
+        q2gx = _maybe_q2_basis(
+            Val(has_q2), tables.q2_coefficient_gx, q)
+        q2gy = _maybe_q2_basis(
+            Val(has_q2), tables.q2_coefficient_gy, q)
+        c = _coefficient_point(
+            _packed4(tables.coefficient_shape, q),
+            _packed4(tables.coefficient_gx, q),
+            _packed4(tables.coefficient_gy, q), q2sh, q2gx, q2gy,
+            coefficient_nodes, q2_coefficient_nodes, cell,
+            coefficients, kd.coefficient_elements)
+        facet = Int(boundary_quadrature.facet[q])
+        point = BoundaryPoint(
+            c, _facet_values(facet_fields, facet),
+            (boundary_quadrature.normal_x[q], boundary_quadrature.normal_y[q]))
+        _accumulate_boundary_point!(
+            kd, Ke, fe, sh_t, gx_t, gy_t, sh_c, gx_c, gy_c, point,
+            boundary_quadrature.weight[q])
     end
     return nothing
 end

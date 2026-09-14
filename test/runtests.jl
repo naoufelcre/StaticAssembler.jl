@@ -148,6 +148,357 @@ run_testset("differential operator instances", "engine") do
     @test sum(b) ≈ 24.0
 end
 
+run_testset("embedded boundary assembly", "engine") do
+    reference = build_cut_reference(
+        1, 1; levelset_values=[-1.0, 1.0, 1.0, 1.0])
+    space = StaticAssembler.FiniteElement(
+        StaticAssembler.Q1ReferenceQuadrilateral(), 1)
+    boundary_coefficient = StaticAssembler.StateFunction() do point
+        nx, ny = boundary_normal(point)
+        gx, gy = coefficient_gradient(point, 1)
+        facet_value(point, 1) + point[1] + 0.2 * (gx * nx + gy * ny)
+    end
+    boundary_source = point -> begin
+        nx, ny = boundary_normal(point)
+        tx, ty = boundary_tangent(point)
+        gx, gy = coefficient_gradient(point, 1)
+        facet_value(point, 1) - point[1] + gx * tx + gy * ty + 2nx + 3ny
+    end
+    form = StaticAssembler.ElementVariationalForm(
+        space, (), (), 1;
+        boundary_bilinear=(StaticAssembler.BilinearSlot(
+            ScaledValueOp(1.0), ScaledValueOp(1.0), boundary_coefficient),),
+        boundary_rhs=(StaticAssembler.RhsSlot(
+            ScaledValueOp(1.0), boundary_source, 1.0),),
+        nfacetfields=1)
+    system = StaticSystem(
+        reference.model, reference.cut_geometry, Int32[1], 1, 1; form)
+    quadrature = system.refresh.boundary_quadrature
+    a = sqrt(3 / 5) / 2
+    ts = (0.5 - a, 0.5, 0.5 + a)
+    @test quadrature.pointers == [1, 4]
+    @test quadrature.facet == Int32[1, 1, 1]
+    @test quadrature.reference_r ≈ [0.5 * (1 - t) for t in ts]
+    @test quadrature.reference_s ≈ [0.5 * t for t in ts]
+    @test quadrature.weight ≈ sqrt(0.5) .* [5 / 18, 4 / 9, 5 / 18]
+    @test all(≈(inv(sqrt(2))), quadrature.normal_x)
+    @test all(≈(inv(sqrt(2))), quadrature.normal_y)
+
+    midpoint_system = StaticSystem(
+        reference.model, reference.cut_geometry, Int32[1], 1, 1; form,
+        boundary_quadrature=(((0.5,),), (1.0,)))
+    @test midpoint_system.refresh.boundary_quadrature.reference_r == [0.25]
+    @test midpoint_system.refresh.boundary_quadrature.reference_s == [0.25]
+    @test midpoint_system.refresh.boundary_quadrature.weight ≈ [sqrt(0.5)]
+
+    values = [1.0, 2.0, 3.0, 5.0]
+    fields = ([2.5],)
+    matrix, vector = assemble!(system, (values,); facet_fields=fields, threaded=false)
+    expected_matrix = zeros(4, 4)
+    expected_vector = zeros(4)
+    for q in eachindex(quadrature.weight)
+        r, s = quadrature.reference_r[q], quadrature.reference_s[q]
+        shape = ((1-r)*(1-s), r*(1-s), (1-r)*s, r*s)
+        gx = (-(1-s), 1-s, -s, s)
+        gy = (-(1-r), -r, 1-r, r)
+        value = sum(shape[i] * values[i] for i in 1:4)
+        dx = sum(gx[i] * values[i] for i in 1:4)
+        dy = sum(gy[i] * values[i] for i in 1:4)
+        nx = ny = inv(sqrt(2))
+        tx, ty = -ny, nx
+        coefficient = fields[1][1] + value + 0.2 * (dx * nx + dy * ny)
+        source = fields[1][1] - value + dx * tx + dy * ty + 2nx + 3ny
+        for col in 1:4, row in 1:4
+            expected_matrix[row, col] +=
+                coefficient * shape[row] * shape[col] * quadrature.weight[q]
+        end
+        for row in 1:4
+            expected_vector[row] += source * shape[row] * quadrature.weight[q]
+        end
+    end
+    @test Matrix(matrix) ≈ expected_matrix rtol=2e-14
+    @test vector ≈ expected_vector rtol=2e-14
+    serial_matrix, serial_vector = copy(matrix), copy(vector)
+    matrix, vector = assemble!(system, (values,); facet_fields=fields, threaded=true)
+    @test matrix == serial_matrix
+    @test vector == serial_vector
+    @test_throws ArgumentError assemble!(system, (values,); threaded=false)
+    @test_throws DimensionMismatch assemble!(
+        system, (values,); facet_fields=(Float64[],), threaded=false)
+
+    ext = Base.get_extension(StaticAssembler, :StaticAssemblerGridapExt)
+    data = ext._cut_geometry_data(reference.cut_geometry, Float64)
+    bad_boundary = BoundaryData{Float64}(
+        data.boundary.facet_to_bgcell, data.boundary.point_ids,
+        data.boundary.point_pointers, [(0.0, 0.0)],
+        data.boundary.physical_points, data.boundary.reference_points)
+    bad_data = CutData{Float64}(
+        data.mesh_id, data.bg_states, data.subcell_states, data.cell_to_bgcell,
+        data.point_ids, data.point_pointers, data.physical_points,
+        data.reference_points, bad_boundary)
+    saved_volume = copy(system.refresh.quadrature.weight)
+    saved_boundary = copy(quadrature.weight)
+    @test_throws ArgumentError refresh_geometry!(system, bad_data, Int32[1])
+    @test system.refresh.quadrature.weight == saved_volume
+    @test quadrature.weight == saved_boundary
+
+    degenerate_boundary = BoundaryData{Float64}(
+        Int32[1, 1], Int32[4, 4, 4, 5], Int32[1, 3, 5],
+        [(0.0, 0.0), data.boundary.normals[1]],
+        data.boundary.physical_points, data.boundary.reference_points)
+    degenerate_data = CutData{Float64}(
+        data.mesh_id, data.bg_states, data.subcell_states, data.cell_to_bgcell,
+        data.point_ids, data.point_pointers, data.physical_points,
+        data.reference_points, degenerate_boundary)
+    refresh_geometry!(system, degenerate_data, Int32[1])
+    @test system.refresh.boundary_quadrature.nfacets == 2
+    @test system.refresh.boundary_quadrature.facet == Int32[2, 2, 2]
+
+    two_segments = build_cut_reference(
+        1, 1; levelset_values=[-1.0, 1.0, 1.0, -1.0], model=reference.model)
+    refresh_geometry!(system, two_segments.cut_geometry, Int32[1])
+    @test system.refresh.boundary_quadrature.pointers == [1, 7]
+    @test system.refresh.boundary_quadrature.facet == Int32[1, 1, 1, 2, 2, 2]
+    two_segment_data = ext._cut_geometry_data(two_segments.cut_geometry, Float64)
+    staging = system.refresh.boundary_quadrature_buffer
+    StaticAssembler._stage_boundary_quadrature!(
+        staging, two_segment_data.boundary, two_segment_data.bg_states,
+        1, 1, system.hx, system.hy, system.boundary_rule)
+    boundary_stage_bytes = @allocated StaticAssembler._stage_boundary_quadrature!(
+        staging, two_segment_data.boundary, two_segment_data.bg_states,
+        1, 1, system.hx, system.hy, system.boundary_rule)
+    @test boundary_stage_bytes <= 4096
+end
+
+run_testset("csg complement states", "engine") do
+    ext = Base.get_extension(StaticAssembler, :StaticAssemblerGridapExt)
+    model = CartesianDiscreteModel((0.0, 1.0, 0.0, 1.0), (4, 3))
+    geometry = disk(0.3, x0=Point(0.5, 0.5))
+    cut_geometry = cut(model, geometry)
+    cut_complement = cut(model, !geometry)
+    data = ext._cut_geometry_data(cut_geometry, Float64)
+    complement = ext._cut_geometry_data(cut_complement, Float64)
+    # Composed states flip the physical phase; cut cells stay cut.
+    @test length(complement.bg_states) == length(data.bg_states)
+    for cell in eachindex(data.bg_states)
+        if data.bg_states[cell] == StaticAssembler.CUT
+            @test complement.bg_states[cell] == StaticAssembler.CUT
+        else
+            @test complement.bg_states[cell] == -data.bg_states[cell]
+        end
+    end
+    @test length(complement.subcell_states) == length(data.subcell_states)
+    for subcell in eachindex(data.subcell_states)
+        @test complement.subcell_states[subcell] == -data.subcell_states[subcell]
+    end
+    # Same interface, opposite outward normals.
+    @test length(complement.boundary.facet_to_bgcell) ==
+        length(data.boundary.facet_to_bgcell)
+    @test complement.boundary.facet_to_bgcell == data.boundary.facet_to_bgcell
+    for facet in eachindex(data.boundary.normals)
+        normal = data.boundary.normals[facet]
+        flipped = complement.boundary.normals[facet]
+        @test flipped[1] ≈ -normal[1]
+        @test flipped[2] ≈ -normal[2]
+    end
+    # Physical areas partition the unit square.
+    function physical_area(cutgeo)
+        mesh, cutdata = ext.from_gridap(model, cutgeo, 4, 3)
+        space = StaticAssembler.FiniteElement(
+            StaticAssembler.Q1ReferenceQuadrilateral(), 1)
+        form = StaticAssembler.ElementVariationalForm(
+            space,
+            (StaticAssembler.BilinearSlot(
+                ScaledValueOp(1.0), ScaledValueOp(1.0),
+                StaticAssembler.ConstantCoefficient(1.0)),),
+            (), 0)
+        roots = Int32.(1:(4 * 3))
+        system = StaticAssembler.StaticSystem(mesh, cutdata, roots; form)
+        quadrature = system.refresh.quadrature
+        return count(!, quadrature.is_cut) * system.hx * system.hy +
+            sum(quadrature.weight)
+    end
+    @test physical_area(cut_geometry) + physical_area(cut_complement) ≈ 1.0 rtol=1e-12
+end
+
+run_testset("boundary defect regressions", "engine") do
+    ext = Base.get_extension(StaticAssembler, :StaticAssemblerGridapExt)
+    cut_reference = build_cut_reference(
+        1, 1; levelset_values=[-1.0, 1.0, 1.0, 1.0])
+    space = StaticAssembler.FiniteElement(
+        StaticAssembler.Q1ReferenceQuadrilateral(), 1)
+    boundary_only = StaticAssembler.ElementVariationalForm(
+        space, (), (), 0;
+        boundary_rhs=(StaticAssembler.RhsSlot(
+            ScaledValueOp(1.0), _ -> 1.0, 1.0),))
+
+    # Missing boundary geometry fails loudly instead of assembling zero terms.
+    _, cutdata = ext.from_gridap(
+        cut_reference.model, cut_reference.cut_geometry, 1, 1)
+    empty_boundary = CutData{Float64}(
+        cutdata.mesh_id, cutdata.bg_states, cutdata.subcell_states,
+        cutdata.cell_to_bgcell, cutdata.point_ids, cutdata.point_pointers,
+        cutdata.physical_points, cutdata.reference_points,
+        BoundaryData{Float64}())
+    mesh = StaticAssembler.Mesh{Float64}(
+        cut_reference.model, 1, 1, 0.0, 0.0, 1.0, 1.0)
+    @test_throws ArgumentError StaticAssembler.StaticSystem(
+        mesh, empty_boundary, Int32[1]; form=boundary_only)
+
+    # A boundary-enabled form on an uncut domain is valid with no terms.
+    interior = build_cut_reference(
+        1, 1; levelset_values=fill(-1.0, 4), model=cut_reference.model)
+    uncut = StaticSystem(
+        interior.model, interior.cut_geometry, Int32[1], 1, 1;
+        form=boundary_only)
+    @test uncut.refresh.boundary_quadrature.nfacets == 0
+    _, uncut_rhs = assemble!(uncut, (); threaded=false)
+    @test iszero(uncut_rhs)
+
+    # Volume callbacks keep the plain-tuple ABI when boundary slots exist
+    # without `coefficient_gradients`.
+    tuple_only(c::Tuple) = c[1]
+    mixed_form = StaticAssembler.ElementVariationalForm(
+        space,
+        (StaticAssembler.BilinearSlot(
+            ScaledValueOp(1.0), ScaledValueOp(1.0),
+            StaticAssembler.StateFunction(tuple_only)),),
+        (), 1;
+        boundary_rhs=(StaticAssembler.RhsSlot(
+            ScaledValueOp(1.0), _ -> 1.0, 1.0),))
+    mixed = StaticSystem(
+        cut_reference.model, cut_reference.cut_geometry, Int32[1], 1, 1;
+        form=mixed_form)
+    mixed_matrix, mixed_rhs = assemble!(
+        mixed, ([1.0, 1.0, 1.0, 1.0],); threaded=false)
+    @test sum(mixed_matrix) ≈ 1 / 8 rtol=1e-12
+    @test sum(mixed_rhs) ≈ sqrt(0.5) rtol=1e-12
+
+    # Heterogeneous facet tuples (e.g. a boolean mask) dispatch.
+    mask_form = StaticAssembler.ElementVariationalForm(
+        space, (), (), 0;
+        boundary_rhs=(StaticAssembler.RhsSlot(
+            ScaledValueOp(1.0),
+            point -> facet_value(point, 1) + 10 * facet_value(point, 2), 1.0),),
+        nfacetfields=2)
+    masked = StaticSystem(
+        cut_reference.model, cut_reference.cut_geometry, Int32[1], 1, 1;
+        form=mask_form)
+    _, masked_rhs = assemble!(
+        masked, (); facet_fields=([2.5], BitVector([true])), threaded=false)
+    _, plain_rhs = assemble!(
+        masked, (); facet_fields=([2.5], [1.0]), threaded=false)
+    @test masked_rhs ≈ plain_rhs rtol=1e-14
+
+    # Tiny meshes keep valid facets: tolerance scales with (hx, hy).
+    tiny = build_cut_reference(
+        1, 1; domain=(0.0, 1e-13, 0.0, 1e-13),
+        levelset_values=[-1.0, 1.0, 1.0, 1.0])
+    tiny_system = StaticSystem(
+        tiny.model, tiny.cut_geometry, Int32[1], 1, 1; form=boundary_only)
+    tiny_quadrature = tiny_system.refresh.boundary_quadrature
+    @test length(tiny_quadrature.weight) == 3
+    @test sum(tiny_quadrature.weight) ≈ 0.5 * sqrt(2.0) * 1e-13 rtol=1e-9
+
+    # Q1 spaces with a Q2 coefficient default to the Q2 quadrature rules.
+    q2coeff_form = StaticAssembler.ElementVariationalForm(
+        space, (), (), 1;
+        coefficient_elements=(StaticAssembler.Q2ReferenceQuadrilateral(),))
+    q2coeff = StaticSystem(
+        interior.model, interior.cut_geometry, Int32[1], 1, 1;
+        form=q2coeff_form)
+    @test length(q2coeff.interior_quadrature.points) == 9
+    @test length(q2coeff.cut_quadrature.points) == 25
+
+    # Tangent convention: counter-clockwise `(-n_y, n_x)`, matching Gridap's
+    # `normal ⋅ TensorValue(0.0, -1.0, 1.0, 0.0)` evaluation order.
+    fixed = StaticAssembler.BoundaryPoint((1.0,), (2.5,), (0.6, 0.8))
+    @test boundary_tangent(fixed) == (-0.8, 0.6)
+    @test VectorValue(0.6, 0.8) ⋅ TensorValue(0.0, -1.0, 1.0, 0.0) ==
+        VectorValue(-0.8, 0.6)
+    @test TensorValue(0.0, -1.0, 1.0, 0.0) ⋅ VectorValue(0.6, 0.8) ==
+        VectorValue(0.8, -0.6)
+end
+
+run_testset("mixed Q1/Q2 assembly scope", "engine") do
+    # Function-scoped allocation/inference check for the mixed Q1/Q2 Article
+    # path: heterogeneous coefficient tuples must resolve at compile time.
+    article_reference = build_cut_reference(4, 3; radius=0.38, center=(0.49, 0.51))
+    article_roots = aggregate(
+        AggregateAllCutCells(), article_reference.cut_geometry)
+    article_data = StaticAssemblerOracle._article_data(article_reference)
+    article_system = StaticSystem(
+        article_reference.model, article_reference.cut_geometry, article_roots,
+        4, 3;
+        form=article_form(ArticleParameters{Float64}()),
+        interior_quadrature=StaticAssemblerOracle._gridap_interior_quadrature(4),
+        cut_quadrature=StaticAssemblerOracle._gridap_cut_quadrature(4))
+    coefficients = article_data.coefficients
+    facet_fields = article_data.facet_fields
+    function serial_assemble()
+        assemble!(article_system, coefficients;
+                  facet_fields=facet_fields, threaded=false)
+    end
+    serial_assemble()
+    @test (@allocated serial_assemble()) <= 65536
+    @test first(@inferred serial_assemble()) isa AbstractMatrix
+end
+
+run_testset("Q2 coefficient interpolation", "engine") do
+    reference = build_cut_reference(
+        1, 1; levelset_values=[-1.0, 1.0, 1.0, 1.0])
+    space = StaticAssembler.FiniteElement(
+        StaticAssembler.Q1ReferenceQuadrilateral(), 1)
+    source = point -> begin
+        gx, gy = coefficient_gradient(point, 1)
+        point[1] + 0.1gx - 0.2gy
+    end
+    form = StaticAssembler.ElementVariationalForm(
+        space, (), (), 1;
+        coefficient_elements=(StaticAssembler.Q2ReferenceQuadrilateral(),),
+        boundary_rhs=(StaticAssembler.RhsSlot(
+            ScaledValueOp(1.0), source, 1.0),))
+    system = StaticSystem(
+        reference.model, reference.cut_geometry, Int32[1], 1, 1; form)
+    polynomial(r, s) = 1 + 2r + 3s + 4r*s + 5r^2 - 2s^2
+    nodes = ((0.0, 0.0), (0.5, 0.0), (1.0, 0.0),
+             (0.0, 0.5), (0.5, 0.5), (1.0, 0.5),
+             (0.0, 1.0), (0.5, 1.0), (1.0, 1.0))
+    values = [polynomial(r, s) for (r, s) in nodes]
+    matrix, vector = assemble!(system, (values,); threaded=false)
+    expected = zeros(4)
+    quadrature = system.refresh.boundary_quadrature
+    for q in eachindex(quadrature.weight)
+        r, s = quadrature.reference_r[q], quadrature.reference_s[q]
+        shape = ((1-r)*(1-s), r*(1-s), (1-r)*s, r*s)
+        value = polynomial(r, s)
+        gx = 2 + 4s + 10r
+        gy = 3 + 4r - 4s
+        for row in 1:4
+            expected[row] += (value + 0.1gx - 0.2gy) *
+                             shape[row] * quadrature.weight[q]
+        end
+    end
+    @test iszero(norm(matrix))
+    @test vector ≈ expected rtol=2e-14
+    @test size(system.refresh.q2_coefficient_prolongation) == (9, 9)
+    @test size(system.refresh.q2_coefficient_nodes) == (9, 1)
+    @test_throws DimensionMismatch assemble!(system, (zeros(4),); threaded=false)
+
+    interior = build_cut_reference(
+        1, 1; levelset_values=fill(-1.0, 4), model=reference.model)
+    gradient_form = StaticAssembler.ElementVariationalForm(
+        space, (), (StaticAssembler.RhsSlot(
+            ScaledValueOp(1.0), point -> coefficient_gradient(point, 1)[1], 1.0),), 1;
+        coefficient_gradients=true)
+    gradient_system = StaticSystem(
+        reference.model, interior.cut_geometry, Int32[1], 1, 1;
+        form=gradient_form)
+    _, gradient_rhs = assemble!(
+        gradient_system, ([0.0, 1.0, 0.0, 1.0],); threaded=false)
+    @test sum(gradient_rhs) ≈ 1.0
+end
+
 run_testset("StaticAssembler", "equivalence") do
     errors = cut_equivalence_errors(8, 7; radius=0.34, center=(0.48, 0.51))
     @test errors.serial.matrix_relative < 5e-13
@@ -173,6 +524,12 @@ run_testset("StaticAssembler", "equivalence") do
     @test stokes_errors.serial.vector_relative < 5e-12
     @test stokes_errors.threaded.matrix_relative < 5e-12
     @test stokes_errors.threaded.vector_relative < 5e-12
+
+    article_errors = article_equivalence_errors(4, 3)
+    @test article_errors.serial.matrix_relative < 5e-12
+    @test article_errors.serial.vector_relative < 5e-12
+    @test article_errors.threaded.matrix_relative < 5e-12
+    @test article_errors.threaded.vector_relative < 5e-12
 
     rectangular_errors = cut_equivalence_errors(
         6, 5; radius=0.299, center=(0.451, 0.503), domain=(0.0, 0.9, 0.0, 1.0))
@@ -592,10 +949,12 @@ run_testset("direct quadrature refresh validation", "engine") do
     B_published = plan.assemble.B
     assert_unchanged()
 
+    # Unused extra level-set entries are ignored: composed states derive
+    # from the geometry tree, so entries no leaf references stay inert.
     push!(cut_geometry.ls_to_bgcell_to_inoutcut, copy(bg_states))
     push!(cut_geometry.ls_to_subcell_to_inout,
           copy(only(cut_geometry.ls_to_subcell_to_inout)))
-    @test_throws ArgumentError refresh_geometry!(plan, cut_geometry, roots)
+    @test refresh_geometry!(plan, cut_geometry, roots) === plan
     pop!(cut_geometry.ls_to_bgcell_to_inoutcut)
     pop!(cut_geometry.ls_to_subcell_to_inout)
     assert_unchanged()

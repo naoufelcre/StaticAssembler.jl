@@ -26,8 +26,10 @@ export KelvinVoigtParameters, kelvin_voigt_form, density, strain_components,
     cut_equivalence_errors, cut_stokes_equivalence_errors,
     cut_agfem_operator, cut_stokes_agfem_operator,
     stable_to_master, agfem_compact_map, naive_quadrature,
-    StokesParameters, stokes_form
-export identity_op, grad_op, symgrad_op, div_op
+    StokesParameters, stokes_form, ArticleParameters, article_form,
+    article_equivalence_errors
+export identity_op, grad_op, symgrad_op, div_op, scalar_value_op,
+    normal_op, tangent_op
 
 # Physics-side differential operators: relocated from the engine, which now ships
 # only the `AbstractDifferentialOperator` contract. The local vector DOF
@@ -38,11 +40,17 @@ struct IdentityOp <: StaticAssembler.AbstractDifferentialOperator end
 struct GradOp <: StaticAssembler.AbstractDifferentialOperator end
 struct SymGradOp <: StaticAssembler.AbstractDifferentialOperator end
 struct DivOp <: StaticAssembler.AbstractDifferentialOperator end
+struct ScalarValueOp <: StaticAssembler.AbstractDifferentialOperator end
+struct NormalOp <: StaticAssembler.AbstractDifferentialOperator end
+struct TangentOp <: StaticAssembler.AbstractDifferentialOperator end
 
 identity_op() = IdentityOp()
 grad_op() = GradOp()
 symgrad_op() = SymGradOp()
 div_op() = DivOp()
+scalar_value_op() = ScalarValueOp()
+normal_op() = NormalOp()
+tangent_op() = TangentOp()
 
 @inline _row_node(row::Int, nnode::Int) = row <= nnode ? row : row - nnode
 @inline _row_comp(row::Int, nnode::Int) = row <= nnode ? 1 : 2
@@ -100,6 +108,34 @@ end
     return (row <= nnode_t ? gx_t[row] : gy_t[row - nnode_t]) * sh_c[col]
 end
 
+@inline function StaticAssembler._op_pair(::ScalarValueOp, ::ScalarValueOp,
+                                          row::Int, col::Int,
+                                          sh_t, gx_t, gy_t, sh_c, gx_c, gy_c)
+    return sh_t[row] * sh_c[col]
+end
+
+@inline function StaticAssembler._boundary_op_pair(::NormalOp, ::NormalOp,
+                                                    row::Int, col::Int,
+                                                    sh_t, gx_t, gy_t,
+                                                    sh_c, gx_c, gy_c, point)
+    nnode_t = length(sh_t)
+    nnode_c = length(sh_c)
+    normal = StaticAssembler.boundary_normal(point)
+    return normal[_row_comp(row, nnode_t)] * sh_t[_row_node(row, nnode_t)] *
+           normal[_row_comp(col, nnode_c)] * sh_c[_row_node(col, nnode_c)]
+end
+
+@inline function StaticAssembler._boundary_op_pair(::TangentOp, ::TangentOp,
+                                                    row::Int, col::Int,
+                                                    sh_t, gx_t, gy_t,
+                                                    sh_c, gx_c, gy_c, point)
+    nnode_t = length(sh_t)
+    nnode_c = length(sh_c)
+    tangent = StaticAssembler.boundary_tangent(point)
+    return tangent[_row_comp(row, nnode_t)] * sh_t[_row_node(row, nnode_t)] *
+           tangent[_row_comp(col, nnode_c)] * sh_c[_row_node(col, nnode_c)]
+end
+
 @inline function StaticAssembler._rhs_contract!(fe, ::IdentityOp, slot, shape,
                                                 gx, gy, c, w, offset::Int)
     src = slot.source(c)
@@ -139,6 +175,42 @@ end
         else
             fe[offset + row] += slot.scale * (F[2, 1] * gx[node] + F[2, 2] * gy[node]) * w
         end
+    end
+    return nothing
+end
+
+
+@inline function StaticAssembler._rhs_contract!(fe, ::ScalarValueOp, slot,
+                                                shape, gx, gy, c, w, offset::Int)
+    value = slot.scale * slot.source(c) * w
+    @inbounds for row in eachindex(shape)
+        fe[offset + row] += value * shape[row]
+    end
+    return nothing
+end
+
+
+@inline function StaticAssembler._boundary_rhs_contract!(
+    fe, ::NormalOp, slot, shape, gx, gy, point, w, offset::Int)
+    value = slot.scale * slot.source(point) * w
+    normal = StaticAssembler.boundary_normal(point)
+    nnode = length(shape)
+    @inbounds for row in 1:2nnode
+        fe[offset + row] += value * normal[_row_comp(row, nnode)] *
+                            shape[_row_node(row, nnode)]
+    end
+    return nothing
+end
+
+
+@inline function StaticAssembler._boundary_rhs_contract!(
+    fe, ::TangentOp, slot, shape, gx, gy, point, w, offset::Int)
+    value = slot.scale * slot.source(point) * w
+    tangent = StaticAssembler.boundary_tangent(point)
+    nnode = length(shape)
+    @inbounds for row in 1:2nnode
+        fe[offset + row] += value * tangent[_row_comp(row, nnode)] *
+                            shape[_row_node(row, nnode)]
     end
     return nothing
 end
@@ -200,6 +272,116 @@ function stokes_form(parameters)
         (StaticAssembler.RhsSlot{1}(identity_op(),
                                c -> VectorValue(0.0, -1.0), 1.0),),
         0)
+end
+
+Base.@kwdef struct ArticleParameters{T <: AbstractFloat}
+    η::T = T(0.8)
+    ξ::T = T(0.07)
+    Δt::T = T(0.2)
+    D::T = T(0.03)
+    a::T = T(0.4)
+    asign::T = T(-0.6)
+    σmax::T = T(0.5)
+    Kb::T = T(0.5)
+    nH::Int = 4
+    γ0::T = T(0.9)
+    γmax::T = T(0.4)
+    Ks::T = T(0.5)
+    mH::Int = 4
+    mar::T = T(0.7)
+    β::T = T(2.1)
+    hΣ::T = T(0.15)
+    slip::T = T(0.12)
+    fric::T = T(0.35)
+end
+
+# Hill constitutive laws shared by the StaticAssembler transcription and the
+# Gridap oracle, mirroring `Article_Cells/src/VarForms.jl` (`ζ̄`, `ζ′`, `γ`, `γ′`).
+@inline _hill_zeta_prime(c, σmax, Kb, nH) =
+    σmax * nH * Kb^nH * c^(nH - 1) / (Kb^nH + c^nH)^2
+@inline _hill_gamma(c, γ0, γmax, Ks, mH) =
+    γ0 + γmax * c^mH / (Ks^mH + c^mH)
+@inline _hill_gamma_prime(c, γmax, Ks, mH) =
+    γmax * mH * Ks^mH * c^(mH - 1) / (Ks^mH + c^mH)^2
+
+"""Q2/Q1/Q1 Brinkman-marker form matching `Article_Cells/src/VarForms.jl`."""
+function article_form(p::ArticleParameters)
+    velocity = StaticAssembler.FiniteElement(
+        StaticAssembler.Q2ReferenceQuadrilateral(), 2)
+    pressure = StaticAssembler.FiniteElement(
+        StaticAssembler.Q1ReferenceQuadrilateral(), 1)
+    marker = StaticAssembler.FiniteElement(
+        StaticAssembler.Q1ReferenceQuadrilateral(), 1)
+    volume_bilinear = (
+        StaticAssembler.BilinearSlot{1,1}(
+            identity_op(), identity_op(), StaticAssembler.ConstantCoefficient(p.η)),
+        StaticAssembler.BilinearSlot{1,1}(
+            grad_op(), grad_op(), StaticAssembler.ConstantCoefficient(p.ξ)),
+        StaticAssembler.BilinearSlot{1,2}(
+            div_op(), identity_op(), StaticAssembler.ConstantCoefficient(-1.0)),
+        StaticAssembler.BilinearSlot{2,1}(
+            identity_op(), div_op(), StaticAssembler.ConstantCoefficient(1.0)),
+        StaticAssembler.BilinearSlot{3,3}(
+            scalar_value_op(), scalar_value_op(),
+            StaticAssembler.ConstantCoefficient(inv(p.Δt))),
+        StaticAssembler.BilinearSlot{3,3}(
+            grad_op(), grad_op(), StaticAssembler.ConstantCoefficient(p.D)),
+    )
+    active_force = point -> begin
+        gx, gy = StaticAssembler.coefficient_gradient(point, 1)
+        scale = p.asign * _hill_zeta_prime(point[1], p.σmax, p.Kb, p.nH)
+        VectorValue(scale * gx, scale * gy)
+    end
+    volume_rhs = (
+        StaticAssembler.RhsSlot{1}(identity_op(), active_force, 1.0),
+        StaticAssembler.RhsSlot{3}(scalar_value_op(), point -> point[2], inv(p.Δt)),
+    )
+    marker_flux = StaticAssembler.StateFunction() do point
+        nx, ny = StaticAssembler.boundary_normal(point)
+        p.a * StaticAssembler.facet_value(point, 2) *
+        (point[3] * nx + point[4] * ny)
+    end
+    normal_penalty = StaticAssembler.StateFunction(
+        point -> p.β / p.hΣ * StaticAssembler.facet_value(point, 3))
+    tangent_penalty = StaticAssembler.StateFunction(
+        point -> p.slip * StaticAssembler.facet_value(point, 3))
+    boundary_bilinear = (
+        StaticAssembler.BilinearSlot{3,3}(
+            scalar_value_op(), scalar_value_op(), marker_flux),
+        StaticAssembler.BilinearSlot{1,1}(
+            normal_op(), normal_op(), normal_penalty),
+        StaticAssembler.BilinearSlot{1,1}(
+            tangent_op(), tangent_op(), tangent_penalty),
+    )
+    normal_traction = point -> begin
+        κ = StaticAssembler.facet_value(point, 1)
+        χΓ = StaticAssembler.facet_value(point, 2)
+        χΣ = StaticAssembler.facet_value(point, 3)
+        Fn = StaticAssembler.facet_value(point, 4)
+        gΣ = StaticAssembler.facet_value(point, 6)
+        -χΓ * _hill_gamma(point[1], p.γ0, p.γmax, p.Ks, p.mH) * κ + Fn +
+            χΣ * p.β / p.hΣ * gΣ
+    end
+    tangent_traction = point -> begin
+        χΓ = StaticAssembler.facet_value(point, 2)
+        Ft = StaticAssembler.facet_value(point, 5)
+        tx, ty = StaticAssembler.boundary_tangent(point)
+        gx, gy = StaticAssembler.coefficient_gradient(point, 1)
+        χΓ * p.mar * _hill_gamma_prime(point[1], p.γmax, p.Ks, p.mH) *
+            (gx * tx + gy * ty) + p.fric * Ft
+    end
+    boundary_rhs = (
+        StaticAssembler.RhsSlot{1}(normal_op(), normal_traction, 1.0),
+        StaticAssembler.RhsSlot{1}(tangent_op(), tangent_traction, 1.0),
+    )
+    q1 = StaticAssembler.Q1ReferenceQuadrilateral()
+    q2 = StaticAssembler.Q2ReferenceQuadrilateral()
+    return StaticAssembler.ElementVariationalForm(
+        (velocity, pressure, marker), (velocity, pressure, marker),
+        volume_bilinear, volume_rhs, 4;
+        coefficient_elements=(q1, q1, q2, q2),
+        coefficient_gradients=true,
+        boundary_bilinear, boundary_rhs, nfacetfields=6)
 end
 
 Base.@kwdef struct KelvinVoigtParameters{T <: AbstractFloat}
@@ -372,6 +554,14 @@ function _gridap_interior_quadrature(degree::Int)
     quadrature = Gridap.ReferenceFEs.Quadrature(Gridap.ReferenceFEs.QUAD, degree)
     return Gridap.ReferenceFEs.get_coordinates(quadrature),
            Gridap.ReferenceFEs.get_weights(quadrature)
+end
+
+function _gridap_cut_quadrature(degree::Int)
+    quadrature = Gridap.ReferenceFEs.Quadrature(Gridap.ReferenceFEs.TRI, degree)
+    points = Gridap.ReferenceFEs.get_coordinates(quadrature)
+    weights = Gridap.ReferenceFEs.get_weights(quadrature)
+    return [(1 - point[1] - point[2], point[1], point[2]) for point in points],
+           2 .* weights
 end
 
 function _analytic_coefficients(nx::Int, ny::Int, hx::Float64, hy::Float64,
@@ -587,6 +777,157 @@ function cut_stokes_agfem_operator(reference::CutStokesGridapReference, roots)
     length(compact_to_stable) == size(matrix, 1) ||
         error("multifield AgFEM DOF count does not match reference matrix")
     return (; matrix, vector, compact_to_stable)
+end
+
+@inline _article_cprev(x, y) = 0.8 + 0.2x - 0.1y + 0.05x*y
+@inline _article_cstar(x, y) = 0.7 - 0.04x + 0.08y + 0.03x*y
+@inline _article_vx(x, y) = 0.15 + 0.2x - 0.1y + 0.07x*y + 0.03x^2
+@inline _article_vy(x, y) = -0.12 + 0.06x + 0.18y - 0.04x*y + 0.02y^2
+
+function _article_data(reference::CutGridapReference)
+    nx, ny = reference.nx, reference.ny
+    coordinates = vec(collect(get_node_coordinates(reference.model)))
+    cprev = [_article_cprev(x[1], x[2]) for x in coordinates]
+    cstar = [_article_cstar(x[1], x[2]) for x in coordinates]
+    origin = first(coordinates)
+    hx, hy = reference.hx, reference.hy
+    vx = Float64[]
+    vy = Float64[]
+    for j in 0:2ny, i in 0:2nx
+        x = origin[1] + i * hx / 2
+        y = origin[2] + j * hy / 2
+        push!(vx, _article_vx(x, y))
+        push!(vy, _article_vy(x, y))
+    end
+    data = StaticAssemblerGridapExt._cut_geometry_data(
+        reference.cut_geometry, Float64)
+    nfacets = length(data.boundary.facet_to_bgcell)
+    κ = [0.9 + 0.01i for i in 1:nfacets]
+    χΣ = [i % 3 == 0 ? 1.0 : 0.0 for i in 1:nfacets]
+    χΓ = [1.0 - value for value in χΣ]
+    Fn = [-0.02 + 0.001i for i in 1:nfacets]
+    Ft = [0.015 - 0.0005i for i in 1:nfacets]
+    gΣ = [0.03 + 0.0007i for i in 1:nfacets]
+    return (; coefficients=(cprev, cstar, vx, vy),
+            facet_fields=(κ, χΓ, χΣ, Fn, Ft, gΣ))
+end
+
+function _article_gridap_operator(reference::CutGridapReference, roots,
+                                  data, prm::ArticleParameters)
+    model, cutgeo = reference.model, reference.cut_geometry
+    nx, ny = reference.nx, reference.ny
+    active = Triangulation(cutgeo, ACTIVE)
+    physical = Triangulation(cutgeo, PHYSICAL)
+    boundary = EmbeddedBoundary(cutgeo)
+    velocity_fe = ReferenceFE(lagrangian, VectorValue{2,Float64}, 2)
+    scalar_fe = ReferenceFE(lagrangian, Float64, 1)
+    velocity_standard = TestFESpace(active, velocity_fe, conformity=:H1)
+    pressure_standard = TestFESpace(active, scalar_fe, conformity=:H1)
+    marker_standard = TestFESpace(active, scalar_fe, conformity=:H1)
+    velocity_test = AgFEMSpace(velocity_standard, roots)
+    pressure_test = AgFEMSpace(pressure_standard, roots)
+    marker_test = AgFEMSpace(marker_standard, roots)
+    velocity_trial = TrialFESpace(velocity_test)
+    pressure_trial = TrialFESpace(pressure_test)
+    marker_trial = TrialFESpace(marker_test)
+
+    background_scalar = FESpace(model, scalar_fe, conformity=:H1)
+    background_velocity = FESpace(model, velocity_fe, conformity=:H1)
+    cprev = interpolate(
+        FEFunction(background_scalar, data.coefficients[1]), marker_test)
+    cstar = interpolate(
+        FEFunction(background_scalar, data.coefficients[2]), marker_test)
+    vprev = interpolate(
+        interpolate(x -> VectorValue(
+            _article_vx(x[1], x[2]), _article_vy(x[1], x[2])),
+            background_velocity), velocity_test)
+    κ, χΓ, χΣ, Fn, Ft, gΣ =
+        (CellField(values, boundary) for values in data.facet_fields)
+    normal = get_normal_vector(boundary)
+    # `normal ⋅ T` evaluates to the counter-clockwise tangent `(-n_y, n_x)`
+    # matching `StaticAssembler.boundary_tangent`. Gridap stores `TensorValue`
+    # column-major, so the reversed order `T ⋅ normal` evaluates to the
+    # opposite (clockwise) tangent and would flip the single-tangent `Ft` term.
+    tangent = normal ⋅ TensorValue(0.0, -1.0, 1.0, 0.0)
+    dΩ = Measure(physical, 4)
+    dΓ = Measure(boundary, 4)
+    ζ′ = c -> _hill_zeta_prime(c, prm.σmax, prm.Kb, prm.nH)
+    γ = c -> _hill_gamma(c, prm.γ0, prm.γmax, prm.Ks, prm.mH)
+    γ′ = c -> _hill_gamma_prime(c, prm.γmax, prm.Ks, prm.mH)
+
+    function bilinear((v, pressure, marker), (w, q, φ))
+        bulk = prm.η * (v ⋅ w) + prm.ξ * (∇(v) ⊙ ∇(w)) -
+               pressure * tr(∇(w)) + q * tr(∇(v)) +
+               marker * φ / prm.Δt + prm.D * (∇(marker) ⋅ ∇(φ))
+        surface = χΓ * prm.a * (vprev ⋅ normal) * marker * φ +
+                  χΣ * (prm.β / prm.hΣ) * (v ⋅ normal) * (w ⋅ normal) +
+                  χΣ * prm.slip * (v ⋅ tangent) * (w ⋅ tangent)
+        return ∫(bulk)dΩ + ∫(surface)dΓ
+    end
+    function linear((w, q, φ))
+        bulk = prm.asign * (ζ′ ∘ cprev) * (∇(cprev) ⋅ w) + cstar * φ / prm.Δt
+        normal_force = -χΓ * (γ ∘ cprev) * κ + Fn + χΣ * (prm.β / prm.hΣ) * gΣ
+        tangent_force = χΓ * prm.mar * (γ′ ∘ cprev) *
+                        (∇(cprev) ⋅ tangent) + prm.fric * Ft
+        return ∫(bulk)dΩ +
+               ∫(normal_force * (w ⋅ normal) +
+                 tangent_force * (w ⋅ tangent))dΓ
+    end
+    Y = MultiFieldFESpace([velocity_test, pressure_test, marker_test])
+    X = MultiFieldFESpace([velocity_trial, pressure_trial, marker_trial])
+    operator = AffineFEOperator(bilinear, linear, X, Y)
+
+    active_bg_cells = collect(get_glue(active, Val(2)).tface_to_mface)
+    q2lattice = StaticAssembler._cell_nodes(
+        StaticAssembler.Q2ReferenceQuadrilateral(), Int32.(active_bg_cells), nx)
+    vstandard = _q2_vector_stable_map(
+        collect(get_cell_dof_ids(velocity_standard)), q2lattice,
+        num_free_dofs(velocity_standard))
+    vcompact = vstandard[Int.(getfield(velocity_test, :mDOF_to_DOF))]
+    q1lattice = StaticAssembler._cell_nodes(
+        StaticAssembler.Q1ReferenceQuadrilateral(), Int32.(active_bg_cells), nx)
+    pressure_offset = 2 * (2nx + 1) * (2ny + 1)
+    pstandard = _q1_scalar_stable_map(
+        collect(get_cell_dof_ids(pressure_standard)), q1lattice,
+        num_free_dofs(pressure_standard), pressure_offset)
+    pcompact = pstandard[Int.(getfield(pressure_test, :mDOF_to_DOF))]
+    marker_offset = pressure_offset + (nx + 1) * (ny + 1)
+    cstandard = _q1_scalar_stable_map(
+        collect(get_cell_dof_ids(marker_standard)), q1lattice,
+        num_free_dofs(marker_standard), marker_offset)
+    ccompact = cstandard[Int.(getfield(marker_test, :mDOF_to_DOF))]
+    compact_to_stable = vcat(vcompact, pcompact, ccompact)
+    matrix, vector = get_matrix(operator), get_vector(operator)
+    return (; matrix, vector, compact_to_stable)
+end
+
+function article_equivalence_errors(nx::Int=4, ny::Int=3;
+                                    parameters=ArticleParameters{Float64}(),
+                                    radius::Real=0.38,
+                                    center=(0.49, 0.51))
+    reference = build_cut_reference(nx, ny; radius, center)
+    roots = aggregate(AggregateAllCutCells(), reference.cut_geometry)
+    data = _article_data(reference)
+    oracle = _article_gridap_operator(reference, roots, data, parameters)
+    system = StaticSystem(
+        reference.model, reference.cut_geometry, roots, nx, ny;
+        form=article_form(parameters),
+        interior_quadrature=_gridap_interior_quadrature(4),
+        cut_quadrature=_gridap_cut_quadrature(4))
+    gridap_to_ours = stable_to_master(system.refresh.E)[oracle.compact_to_stable]
+    all(!iszero, gridap_to_ours) ||
+        error("Article AgFEM DOFs do not cover the master set exactly")
+    B, b = StaticAssembler.assemble!(
+        system, data.coefficients;
+        facet_fields=data.facet_fields, threaded=false)
+    serial = _errors(B[gridap_to_ours, gridap_to_ours], b[gridap_to_ours],
+                     oracle.matrix, oracle.vector)
+    B, b = StaticAssembler.assemble!(
+        system, data.coefficients;
+        facet_fields=data.facet_fields, threaded=true)
+    threaded = _errors(B[gridap_to_ours, gridap_to_ours], b[gridap_to_ours],
+                       oracle.matrix, oracle.vector)
+    return (; serial, threaded, system, data)
 end
 
 # Background-indexed naive cut quadrature from Gridap's own measure, for

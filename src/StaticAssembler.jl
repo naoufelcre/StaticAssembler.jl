@@ -42,9 +42,10 @@ include("Assembly.jl")
 include("StaticSystem.jl")
 
 export StaticSystem, refresh_geometry!, assemble!, restrict_solution!
-export Mesh, CutData
+export Mesh, CutData, BoundaryData
 export ElementVariationalForm, LocalForm, BilinearSlot, RhsSlot
 export ConstantCoefficient, FieldCoefficient, StateFunction
+export coefficient_gradient, facet_value, boundary_normal, boundary_tangent
 export FiniteElement
 # Note: `FESpace` stays available as `StaticAssembler.FESpace` for backward
 # compatibility but is intentionally not exported: Gridap also exports `FESpace`.

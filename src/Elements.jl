@@ -6,8 +6,7 @@
 # basis, quadrature rules, and background-grid connectivity are methods on the
 # element type, so dispatch keeps the hot loop type-stable. Vector spaces are
 # the element ⊗ R² with component-blocked DOF ordering; scalar coefficient
-# fields always interpolate with `Q1ReferenceQuadrilateral` shapes on the Q1
-# node lattice.
+# fields interpolate on their declared Q1 or Q2 node lattice.
 
 abstract type ReferenceFiniteElement end
 const AbstractReferenceElement = ReferenceFiniteElement
@@ -75,6 +74,12 @@ end
 @inline _triangle_orbit3(a) = ((a, a, 1 - 2a), (a, 1 - 2a, a), (1 - 2a, a, a))
 @inline _triangle_orbit6(a, b, c) =
     ((a, b, c), (a, c, b), (b, a, c), (b, c, a), (c, a, b), (c, b, a))
+
+# Three-point Gauss rule on [0,1], matching Gridap's degree-4 segment rule.
+@inline function boundary_rule(::ReferenceFiniteElement)
+    a = sqrt(3 / 5) / 2
+    return ((0.5 - a,), (0.5,), (0.5 + a,)), (5 / 18, 4 / 9, 5 / 18)
+end
 
 # ---- Q1 reference quadrilateral (Ciarlet Q1) ---------------------------------
 
