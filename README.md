@@ -1,4 +1,4 @@
-# StaticAssembler.jl
+# ![visuel](icon.svg) StaticAssembler.jl
 
 Fast repeated finite-element assembly on evolving 2D Cartesian cut domains.
 
@@ -16,6 +16,10 @@ lattice.
 Changing the form, finite-element spaces, or background mesh requires a new
 `StaticSystem`; changing coefficients uses `assemble!`; changing cut geometry
 or aggregate roots uses `refresh_geometry!`.
+
+### What's new
+
+During structural geometry refresh, StaticAssembler classifies cell constraints as identity, permutation, or dense. Identity and permutation cells use copies or reindexing instead of dense products. Dense transforms use `mul!` on constraint-sized views, and non-structural refreshes reuse the cached classification.
 
 ### DONE
 

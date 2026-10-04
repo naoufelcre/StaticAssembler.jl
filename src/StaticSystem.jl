@@ -69,6 +69,10 @@ struct AssembleCache{T,N,MT}
     colors::Vector{Vector{Int32}}
     thread_buffers::Vector{ThreadBuffer{T}}
     extended_coefficients::NTuple{N,Vector{T}}
+    # Per-cell constraint kind (dense / permutation / identity) and, for a
+    # nontrivial permutation, the raw-local index of each effective row.
+    constraint_kinds::Vector{UInt8}
+    constraint_perms::Vector{Vector{Int32}}
 end
 
 mutable struct StaticSystem{T,N,LK,MT}
@@ -459,6 +463,9 @@ function refresh_geometry!(plan::StaticSystem{T}, cutdata::CutData{T},
             T, new_cell_dofs, new_constraints, spaces,
             r.element_tables.coefficient_elements, bg_states, roots,
             plan.nx, plan.ny)
+        constraint_kinds = Vector{UInt8}(undef, length(new_constraints))
+        constraint_perms = Vector{Vector{Int32}}(undef, length(new_constraints))
+        _classify_constraints!(constraint_kinds, constraint_perms, new_constraints)
         n_m = size(E, 2)
         pattern_rows = Vector{Vector{Int}}()
         B = _pattern_from_ragged_dofs!(
@@ -483,7 +490,8 @@ function refresh_geometry!(plan::StaticSystem{T}, cutdata::CutData{T},
                                     r.q2_coefficient_nodes)
         plan.assemble = AssembleCache(B, b_m, new_cell_dofs, new_constraints,
                                       slots, pattern_rows, colors, buffers,
-                                      a.extended_coefficients)
+                                      a.extended_coefficients,
+                                      constraint_kinds, constraint_perms)
         r = plan.refresh
         a = plan.assemble
     end
@@ -595,7 +603,8 @@ function StaticSystem(
         ntuple(Val(Int(form.ncoefficients))) do field
             element = form.coefficient_elements[field]
             zeros(T, node_grid(element, nx) * node_grid(element, ny))
-        end)
+        end,
+        UInt8[], Vector{Int32}[])
     plan = StaticSystem(
         nx, ny, mesh.hx, mesh.hy, mesh.mesh_id,
         interior, cut, boundary, refresh, assemble)
@@ -660,7 +669,8 @@ function assemble_serial!(plan::StaticSystem,
     @inbounds for cell in 1:(plan.nx * plan.ny)
         r.cell_states[cell] == OUT && continue
         _assemble_cell!(scratch, plan, cell, coefficients, facet_fields)
-        _transform_agfem!(scratch, a.test_constraints[cell])
+        _transform_agfem!(scratch, a.test_constraints[cell],
+                          a.constraint_kinds[cell], a.constraint_perms[cell])
         _scatter_projected!(plan, scratch, cell)
     end
     return a.B, a.b_m
@@ -679,7 +689,8 @@ function assemble_threaded!(plan::StaticSystem,
             r.cell_states[cell] == OUT && continue
             scratch = a.thread_buffers[Threads.threadid()]
             _assemble_cell!(scratch, plan, cell, coefficients, facet_fields)
-            _transform_agfem!(scratch, a.test_constraints[cell])
+            _transform_agfem!(scratch, a.test_constraints[cell],
+                              a.constraint_kinds[cell], a.constraint_perms[cell])
             _scatter_projected!(plan, scratch, cell)
         end
     end

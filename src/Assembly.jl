@@ -10,6 +10,60 @@ struct ThreadBuffer{T}
     effective_vector::Vector{T}
 end
 
+# Constraint classification for the AgFEM transform. The per-cell constraint
+# `Cᵀ` maps master values to raw local values; `C` projects local loads.
+# When `C` is an exact unit
+# permutation, `C·K·Cᵀ` is only a reindex and the O(nt³) dense loops collapse
+# to O(nt²); every uncut self-rooted cell has such a `C`.
+const CONSTRAINT_DENSE = 0x00
+const CONSTRAINT_PERMUTATION = 0x01
+const CONSTRAINT_IDENTITY = 0x02
+
+# Classify one constraint matrix once per structural refresh. The permutation
+# fast path is a valid representation of `C` only when there is exactly one
+# entry per row and per column and every entry is `one(T)`:
+#     C[p, i] = δ(i, perm[p])   <=>  effective K[p, q] = raw K[perm[p], perm[q]].
+# Rectangular, dense, weighted, or near-permutation tables return
+# `CONSTRAINT_DENSE` and keep the original dense transform. Identity is the
+# special permutation `perm[p] == p`, stored without a permutation vector.
+function _classify_constraint(C::AbstractMatrix{T}) where {T}
+    neff, nraw = size(C)
+    neff == nraw || return (CONSTRAINT_DENSE, Int32[])
+    n = neff
+    n == 0 && return (CONSTRAINT_IDENTITY, Int32[])
+    perm = Vector{Int32}(undef, n)
+    seen = falses(n)
+    identity = true
+    @inbounds for row in 1:n
+        column = 0
+        for col in 1:n
+            value = C[row, col]
+            iszero(value) && continue
+            value == one(T) || return (CONSTRAINT_DENSE, Int32[])
+            column == 0 || return (CONSTRAINT_DENSE, Int32[])
+            seen[col] && return (CONSTRAINT_DENSE, Int32[])
+            seen[col] = true
+            column = col
+        end
+        column == 0 && return (CONSTRAINT_DENSE, Int32[])
+        perm[row] = column
+        column == row || (identity = false)
+    end
+    return (identity ? CONSTRAINT_IDENTITY : CONSTRAINT_PERMUTATION,
+            identity ? Int32[] : perm)
+end
+
+function _classify_constraints!(kinds::AbstractVector{UInt8},
+                                perms::AbstractVector,
+                                constraints)
+    length(kinds) == length(perms) == length(constraints) ||
+        throw(ArgumentError("constraint classification arrays have mismatched lengths"))
+    @inbounds for cell in eachindex(constraints)
+        kinds[cell], perms[cell] = _classify_constraint(constraints[cell])
+    end
+    return nothing
+end
+
 @inline function _nz_position(matrix::SparseMatrixCSC, row::Integer, column::Integer)
     lo = Int(matrix.colptr[column])
     hi = Int(matrix.colptr[column + 1] - 1)
@@ -142,31 +196,40 @@ end
 
 @inline function _transform_agfem!(
     scratch::ThreadBuffer{T}, C::AbstractMatrix{T},
+    kind::UInt8 = CONSTRAINT_DENSE,
+    perm::AbstractVector{Int32} = Int32[],
 ) where {T}
     nt = size(C, 1)
-    nu = size(C, 1)
-    nraw = size(scratch.raw_matrix, 1)
-    nraw_col = size(scratch.raw_matrix, 2)
-    @inbounds for row in 1:nt, raw_column in 1:nraw_col
-        value = zero(T)
-        for raw_row in 1:nraw
-            value += C[row, raw_row] * scratch.raw_matrix[raw_row, raw_column]
+    if kind == CONSTRAINT_IDENTITY
+        @inbounds for column in 1:nt, row in 1:nt
+            scratch.effective_matrix[row, column] = scratch.raw_matrix[row, column]
         end
-        scratch.left_matrix[row, raw_column] = value
-    end
-    @inbounds for column in 1:nu, row in 1:nt
-        value = zero(T)
-        for raw_column in 1:nraw_col
-            value += scratch.left_matrix[row, raw_column] * C[column, raw_column]
+        @inbounds for row in 1:nt
+            scratch.effective_vector[row] = scratch.raw_vector[row]
         end
-        scratch.effective_matrix[row, column] = value
-    end
-    @inbounds for row in 1:nt
-        value = zero(T)
-        for raw_row in 1:nraw
-            value += C[row, raw_row] * scratch.raw_vector[raw_row]
+        return nothing
+    elseif kind == CONSTRAINT_PERMUTATION
+        @inbounds for column in 1:nt, row in 1:nt
+            scratch.effective_matrix[row, column] =
+                scratch.raw_matrix[perm[row], perm[column]]
         end
-        scratch.effective_vector[row] = value
+        @inbounds for row in 1:nt
+            scratch.effective_vector[row] = scratch.raw_vector[perm[row]]
+        end
+        return nothing
     end
+    # Genuine dense constraints: K_eff = C·K·Cᵀ and f_eff = C·f, with
+    #     (m×n)(n×n) -> (m×n), (m×n)(n×m) -> (m×m), (m×n)(n) -> (m).
+    # Views size every product to this cell's constraint; the shared buffers may
+    # be larger. Summation order can differ from the scalar loops, so callers
+    # use roundoff-based tolerances rather than bit equality.
+    m = size(C, 1)
+    n = size(C, 2)
+    raw_view = view(scratch.raw_matrix, 1:n, 1:n)
+    left_view = view(scratch.left_matrix, 1:m, 1:n)
+    effective_view = view(scratch.effective_matrix, 1:m, 1:m)
+    mul!(left_view, C, raw_view)
+    mul!(effective_view, left_view, transpose(C))
+    mul!(view(scratch.effective_vector, 1:m), C, view(scratch.raw_vector, 1:n))
     return nothing
 end
