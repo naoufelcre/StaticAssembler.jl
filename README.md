@@ -46,7 +46,7 @@ During structural geometry refresh, StaticAssembler classifies cell constraints 
 - Local boundary bilinear and right-hand-side terms, including penalty,
   Neumann, Robin, and user-defined single-sided trace contractions.
 
-### TODO/FUTURE WORK ??
+### TODO
 
 - Boundary data varying independently at every quadrature point rather than
   once per embedded facet.

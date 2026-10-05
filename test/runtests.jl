@@ -21,6 +21,15 @@ using Test
 # names. Groups: "equivalence" (Gridap-oracle comparisons) and "engine"
 # (structural invariants of the cut-quadrature refresh path).
 const SELECTED = Set(ARGS)
+if isempty(SELECTED) || "engine" in SELECTED || "transform_fastpath" in SELECTED
+    include("TestTransformFastPath.jl")
+end
+if isempty(SELECTED) || "engine" in SELECTED || "dense_transform" in SELECTED
+    include("TestDenseTransform.jl")
+end
+if isempty(SELECTED) || "engine" in SELECTED || "raw_coefficients" in SELECTED
+    include("TestRawCoefficients.jl")
+end
 # `do`-block syntax passes the anonymous function as the first argument.
 function run_testset(body, name, group)
     if isempty(SELECTED) || name in SELECTED || group in SELECTED

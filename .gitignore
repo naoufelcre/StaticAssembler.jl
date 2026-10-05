@@ -1,7 +1,12 @@
 .DS_Store
+Manifest.toml
+Manifest-v*.toml
 *.mem
 APIboundary.Md
 .gitignore
 benchmark/
 oracle/
-test/
+test/*
+!test/TestTransformFastPath.jl
+!test/TestDenseTransform.jl
+!test/TestRawCoefficients.jl

@@ -699,14 +699,26 @@ end
 
 """
     assemble!(system::StaticSystem, coefficients::NTuple{N,AbstractVector};
-              facet_fields=(), threaded=true)
+              facet_fields=(), threaded=true, extend_coefficients=true)
 
 Assemble the projected operator `B = EᵀAE` (a real `n_m × n_m` sparse matrix)
 and the projected right-hand side `b_m = Eᵀb` from background-node coefficient
-arrays (one per element-table coefficient field). Coefficient fields are
-prolonged to the full lattice with the stored Q1 coefficient prolongation,
-then assembled. `facet_fields` is a tuple of arrays in the current embedded
-boundary facet order; these values are not prolonged.
+arrays (one per element-table coefficient field). Every array holds one value
+per background lattice node of that field's Q1/Q2 element; this node count is
+validated in both modes. With `extend_coefficients=true` (default) each field
+is prolonged to the full lattice with the stored coefficient prolongation
+(the AgFEM root interpolation), so cut-cell nodes take their aggregate-root
+values. With `extend_coefficients=false` the arrays are copied verbatim into
+the assembly buffers, so each cut cell keeps its own raw nodal values. Use the
+raw mode to feed a field that already lives on the full background lattice
+(for example a previous Qm solution or an analytic field sampled at the
+lattice nodes) without reprojecting it through the current aggregation.
+Because the raw cut-cell values are the *current* cell polynomials, a previous
+Qm solution on a shrinking domain must retain its old cut-cell polynomials for
+the restriction (evaluating the old FE function, not re-interpolating the old
+master values through the new roots) to be reproduced by this path.
+`facet_fields` is a tuple of arrays in the current embedded boundary facet
+order; these values are not prolonged.
 Returns `(B, b_m)`, both owned by the system and overwritten by the next call
 or invalidated by a structural `refresh_geometry!`.
 Solve with `cholesky(B)` or any solver on `B`; `diag(B)` is the diagonal
@@ -715,7 +727,8 @@ preconditioner. Extend solutions with `system.refresh.E * u_m`.
 function assemble!(plan::StaticSystem,
                    coefficients::NTuple{N,AbstractVector};
                    facet_fields=(),
-                   threaded::Bool=true) where {N}
+                   threaded::Bool=true,
+                   extend_coefficients::Bool=true) where {N}
     a = plan.assemble
     r = plan.refresh
     length(coefficients) == length(a.extended_coefficients) ||
@@ -735,7 +748,11 @@ function assemble!(plan::StaticSystem,
         length(coefficients[field]) == size(P, 1) ||
             throw(DimensionMismatch(
                 "coefficient field $field has the wrong background-node count"))
-        mul!(a.extended_coefficients[field], P, coefficients[field])
+        if extend_coefficients
+            mul!(a.extended_coefficients[field], P, coefficients[field])
+        else
+            copyto!(a.extended_coefficients[field], coefficients[field])
+        end
     end
     threaded ? assemble_threaded!(plan, a.extended_coefficients, facet_fields) :
                assemble_serial!(plan, a.extended_coefficients, facet_fields)
