@@ -56,8 +56,6 @@ end
 function _classify_constraints!(kinds::AbstractVector{UInt8},
                                 perms::AbstractVector,
                                 constraints)
-    length(kinds) == length(perms) == length(constraints) ||
-        throw(ArgumentError("constraint classification arrays have mismatched lengths"))
     @inbounds for cell in eachindex(constraints)
         kinds[cell], perms[cell] = _classify_constraint(constraints[cell])
     end
@@ -74,7 +72,6 @@ end
 end
 
 function _ragged_scatter_slots!(slots, matrix, test_dofs, trial_dofs)
-    length(test_dofs) == length(trial_dofs) || error("test/trial cell count mismatch")
     old_length = length(slots)
     resize!(slots, length(test_dofs))
     for cell in (old_length + 1):length(slots)

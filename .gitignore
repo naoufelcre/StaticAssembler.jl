@@ -7,6 +7,4 @@ APIboundary.Md
 benchmark/
 oracle/
 test/*
-!test/TestTransformFastPath.jl
-!test/TestDenseTransform.jl
-!test/TestRawCoefficients.jl
+!test/*.jl

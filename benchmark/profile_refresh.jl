@@ -36,12 +36,13 @@ function main(n=128, order=2)
     end
     tables = timed("static_tables") do
         StaticAssembler._refresh_static_tables!(Float64, a.test_cell_dofs,
-            a.test_constraints, r.element_tables.test_space, cutdata.bg_states,
+            a.test_constraints, r.element_tables.test_space,
+            r.element_tables.coefficient_elements, cutdata.bg_states,
             moved_roots, n, n)
     end
     E, _ = tables
     B = timed("sparse_pattern") do
-        StaticAssembler._pattern_from_ragged_dofs!(a.B, a.pattern_rows,
+        StaticAssembler._pattern_from_ragged_dofs!(a.B, Vector{Vector{Int}}(),
             a.test_cell_dofs, a.test_cell_dofs, size(E, 2), size(E, 2))
     end
     timed("scatter_slots") do

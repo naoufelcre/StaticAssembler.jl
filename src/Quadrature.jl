@@ -229,7 +229,6 @@ function _validate_and_size_staging!(
     end
 
     current_bg_cell = 0
-    cut_triangles = 0
     cut_area = zero(T)
     cell_area = hx * hy
     area_tolerance = T(512) * eps(T) * max(one(T), cell_area)
@@ -253,7 +252,6 @@ function _validate_and_size_staging!(
             bg_states[bg_cell] == CUT ||
                 throw(ArgumentError("subcell is attached to an uncut background cell"))
             current_bg_cell = bg_cell
-            cut_triangles = 0
             cut_area = zero(T)
         end
 
@@ -297,7 +295,6 @@ function _validate_and_size_staging!(
         # subtriangles in GridapEmbedded. They contribute no quadrature points.
         if bg_state == CUT && subcell_state == IN &&
            physical_det > physical_det_tolerance
-            cut_triangles += 1
             cut_area += physical_det / 2
         end
     end

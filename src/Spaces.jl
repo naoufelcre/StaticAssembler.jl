@@ -9,7 +9,6 @@ function _cell_nodes(el::ReferenceFiniteElement, active_bg_cells, nx::Int)
 end
 
 function _effective_cell_colors(test_dofs, trial_dofs)
-    length(test_dofs) == length(trial_dofs) || error("test/trial cell count mismatch")
     colors = Vector{Vector{Int32}}()
     used_dofs = BitSet[]
     for cell in eachindex(test_dofs)

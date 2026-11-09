@@ -9,7 +9,7 @@
 #   b_m : n_m          projected right-hand side = Eᵀb
 #
 # `assemble!` returns `(B, b_m)`. The solution lives on the n_m master
-# (stable) DOFs; `E` (stored at `system.refresh.E`) maps it back to the full
+# (stable) DOFs; `E = extension(system)` maps it back to the full
 # background lattice with one matmul (`u_full = E * u_m`, allocation-free via
 # `mul!`; `restrict_solution!` extracts its master rows). `B` is a real sparse matrix, so
 # `cholesky(B)` or `Preconditioners.jl` work directly.
@@ -65,7 +65,6 @@ struct AssembleCache{T,N,MT}
     test_cell_dofs::Vector{Vector{Int32}}
     test_constraints::Vector{Matrix{T}}
     scatter_slots::Vector{Vector{Int}}
-    pattern_rows::Vector{Vector{Int}}
     colors::Vector{Vector{Int32}}
     thread_buffers::Vector{ThreadBuffer{T}}
     extended_coefficients::NTuple{N,Vector{T}}
@@ -472,7 +471,6 @@ function refresh_geometry!(plan::StaticSystem{T}, cutdata::CutData{T},
             spzeros(T, 0, 0), pattern_rows, new_cell_dofs, new_cell_dofs, n_m, n_m)
         slots = _ragged_scatter_slots!(
             Vector{Vector{Int}}(), B, new_cell_dofs, new_cell_dofs)
-        validate_sparse_slots(B, new_cell_dofs, new_cell_dofs, slots)
         colors = _effective_cell_colors(new_cell_dofs, new_cell_dofs)
         max_test = maximum(length, new_cell_dofs; init=0)
         ntest_raw = sum(ndofs(space) for space in spaces)
@@ -489,7 +487,7 @@ function refresh_geometry!(plan::StaticSystem{T}, cutdata::CutData{T},
                                     r.coefficient_nodes, P2,
                                     r.q2_coefficient_nodes)
         plan.assemble = AssembleCache(B, b_m, new_cell_dofs, new_constraints,
-                                      slots, pattern_rows, colors, buffers,
+                                      slots, colors, buffers,
                                       a.extended_coefficients,
                                       constraint_kinds, constraint_perms)
         r = plan.refresh
@@ -599,7 +597,7 @@ function StaticSystem(
     assemble = AssembleCache(
         spzeros(T, 0, 0), T[],
         Vector{Vector{Int32}}(), Vector{Matrix{T}}(), Vector{Vector{Int}}(),
-        Vector{Vector{Int}}(), Vector{Vector{Int32}}(), ThreadBuffer{T}[],
+        Vector{Vector{Int32}}(), ThreadBuffer{T}[],
         ntuple(Val(Int(form.ncoefficients))) do field
             element = form.coefficient_elements[field]
             zeros(T, node_grid(element, nx) * node_grid(element, ny))
@@ -612,11 +610,20 @@ function StaticSystem(
 end
 
 """
+    extension(system::StaticSystem)
+
+Return the system-owned sparse operator mapping master DOFs to the background
+lattice, without copying. Do not mutate it; reacquire it after a structural
+`refresh_geometry!`, which may replace it and renumber master DOFs.
+"""
+extension(system::StaticSystem) = system.refresh.E
+
+"""
     restrict_solution!(u_m, system, u_full)
 
 Copy the master rows of a full-background solution into the compact projected
 solution vector. This is the left inverse of extension for vectors in the
-range of `system.refresh.E`.
+range of `extension(system)`.
 """
 function restrict_solution!(u_m::AbstractVector, plan::StaticSystem,
                             u_full::AbstractVector)
@@ -722,7 +729,7 @@ order; these values are not prolonged.
 Returns `(B, b_m)`, both owned by the system and overwritten by the next call
 or invalidated by a structural `refresh_geometry!`.
 Solve with `cholesky(B)` or any solver on `B`; `diag(B)` is the diagonal
-preconditioner. Extend solutions with `system.refresh.E * u_m`.
+preconditioner. Extend solutions with `extension(system) * u_m`.
 """
 function assemble!(plan::StaticSystem,
                    coefficients::NTuple{N,AbstractVector};

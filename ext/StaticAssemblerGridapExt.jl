@@ -73,10 +73,7 @@ function _cut_geometry_data(cut_geometry, ::Type{T}; include_boundary::Bool=true
     )
 end
 
-function _validate_model_metrics(model, nx::Int, ny::Int, hx::T, hy::T) where {T}
-    coordinates = get_node_coordinates(model)
-    length(coordinates) == (nx + 1) * (ny + 1) ||
-        throw(ArgumentError("background model dimensions do not match nx and ny"))
+function _validate_model_metrics(coordinates, nx::Int, ny::Int, hx::T, hy::T) where {T}
     lower_left = coordinates[1]
     x_neighbor = coordinates[2]
     y_neighbor = coordinates[nx + 2]
@@ -102,12 +99,14 @@ function from_gridap(model, cut_geometry, nx::Int, ny::Int)
     T = _T
     nx > 0 && ny > 0 || throw(ArgumentError("nx and ny must be positive"))
     coordinates = get_node_coordinates(model)
+    length(coordinates) == (nx + 1) * (ny + 1) ||
+        throw(ArgumentError("background model dimensions do not match nx and ny"))
     origin = first(coordinates)
     hx = T(coordinates[2][1] - origin[1])
     hy = T(coordinates[nx + 2][2] - origin[2])
     isfinite(hx) && isfinite(hy) && hx > 0 && hy > 0 ||
         throw(ArgumentError("background grid metrics must be finite and positive"))
-    _validate_model_metrics(model, nx, ny, hx, hy)
+    _validate_model_metrics(coordinates, nx, ny, hx, hy)
     mesh = Mesh{T}(model, nx, ny, T(origin[1]), T(origin[2]), hx, hy)
     cutdata = _cut_geometry_data(cut_geometry, T)
     cutdata.mesh_id === model ||

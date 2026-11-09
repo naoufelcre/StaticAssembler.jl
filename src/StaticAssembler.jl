@@ -19,7 +19,7 @@ module StaticAssembler
 #   assemble!(...)                assemble the projected operator B=EᵀAE and RHS
 #
 # The projection is implicit in B: E is built from the aggregate roots and
-# stored at `system.refresh.E` (a real sparse matrix), the raw per-cell blocks
+# available through `extension(system)` (a real sparse matrix), the raw per-cell blocks
 # are projected by the constraint tables, and B is the real sparse operator
 # solved directly (cholesky / Preconditioners.jl). Solutions are extended to
 # the full background lattice with `E * u_m` (allocation-free via
@@ -41,7 +41,7 @@ include("Spaces.jl")
 include("Assembly.jl")
 include("StaticSystem.jl")
 
-export StaticSystem, refresh_geometry!, assemble!, restrict_solution!
+export StaticSystem, refresh_geometry!, assemble!, extension, restrict_solution!
 export Mesh, CutData, BoundaryData
 export ElementVariationalForm, LocalForm, BilinearSlot, RhsSlot
 export ConstantCoefficient, FieldCoefficient, StateFunction
