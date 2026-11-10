@@ -1,64 +1,120 @@
 # ![visuel](icon.svg) StaticAssembler.jl
 
-Fast repeated finite-element assembly on evolving 2D Cartesian cut domains.
+Specialized custom assembler and data structure for aggregated nodal finite element methods on 2D evolving domains.
 
-The projected system is
+This is a research toolbox to explore, not a fully fleshed out finite element framework. For the latter, we encourage you to look after the following libraries in the `Julia` programming language:
 
-```text
-B = E' * A * E
-b_m = E' * b
+- `GridapEmbedded.jl`: A reference implementation of the aggregated finite element method (AgFEM).
+- `Ferrite.jl`: Low-level FEM framework.
+
+`StaticAssembler.jl` is related to `EvolvingDomains.jl`. Both libraries were designed as part of my PHD thesis.
+
+About **AgFEM** see : **The aggregated unfitted finite element method for elliptic problems**  ![Static Badge](https://img.shields.io/badge/doi%3A-10.1016%2Fj.cma.2018.03.022-red)
+
+
+If you are interested in this work, please get in touch.
+Contact: **naoufel.cresson@inria.fr** 
+https://www.ljll.fr/~cresson/
+-------------------------------------------------
+
+# Quickstart
+
+Let $\Omega_n$ be a collection of domains embedded in a larger discrete ambiant space $\mathcal{A}$.
+The objective of the package was to find a efficient and convenient way to leverage the shared $\mathcal{A}$ to reduces repeated allocations and matrix assembly when solving FEM problems on different elements of $\Omega_n$.
+
+## AgFEM in a nutshell, and our take on it
+
+### Aggregates
+
+Let $\Omega$ be a domain embedded in $\mathcal{A}$. Cells of $\mathcal{A}$ can be classified as `IN` if the cell is fully inside $\Omega$, `CUT` if the cell is crossed by the boundary of $\Omega$ and `OUT` if the cell is completely outside of $\Omega$.
+
+Based on this classification we can define *aggregates*. An aggregate is simply a map between `CUT`-cells and `IN`-cells.
+
+*Note that `StaticAssembler` purposely do not provide built-in methods to generate aggregate. To generate them methods are available in `GridapEmbedded` or `EvolvingDomains`.*
+
+$\mathcal{A}$ provides the cells and associated DOFs. Only `IN` and `CUT` cells contribute to the system, with the latter integrated over their intersection with $\Omega$. Without aggregation, assembling these contributions gives a matrix $A$ and a right-hand side $b$, defined on all $\mathcal{A}$-DOFs. This system may be ill-conditioned due to arbitrarily small intersections of `CUT` cells with $\Omega$.
+
+The ill conditioning problem is adressed by enforcing constraints between the DOFs. Provided the aggregate map, DOFs belonging to cut cells can be reformulated in term of DOFs belonging to their respective root cells. This distinguishes *master* DOFs, which remain independent, from *slave* DOFs, whose values are determined by the master DOFs.
+
+### The extension operator and assembling the FEM matrix
+
+Constraint above define the AgFEM *extension operator* $E$, which maps the independent master DOFs to the DOFs of the active ambient discretization:
+
+$$
+u_{\mathrm{bg}} = E u_m.
+$$
+
+For master DOFs, $E$ simply preserves their values. For slave DOFs, it evaluates the finite-element basis of the corresponding root cell at the slave DOF locations.
+
+Using this operator, the system is projected onto the master DOFs:
+
+$$
+B = E^T A E, \qquad b_m = E^T b.
+$$
+
+$B$ and $b_m$ are then the AgFEM matrix.
+
+The benefit of proceeding as such is twofold:
+ 1. It allows for a static memory layout, we only allocate once all DOFs. This allow for true gain when dealing with large systems involving frequent domain changes. (For instance moving domain problems)
+
+The above presentation stays at the high-level on purpose, for more details (e.g. the full algebraic mess) we refer to the documentation : [docs/details.md](docs/details.md).
+
+## Package specs
+
+In the following, code snippets are illustrative
+
+### Inputs: Geometric specs and Variational forms
+
+Inputs are of two different types:
+
+**Geometric specs** (`src/Descriptors.jl`): structured `Mesh`, `CutData` (cell classification, embedded subcells and their reference quadrature) and optional `BoundaryData` (facets, normals). 
+
+**Variational forms** (`src/Forms.jl`): `ElementVariationalForm` names the test/trial blocks, differential operators, coefficient rules and sources. 
+
+```julia
+mesh = Mesh(mesh_id, nx, ny, x0, y0, hx, hy)
+form = ElementVariationalForm(Q1, Q1, bilinear, rhs, ncoefficients)
 ```
 
-where `A` and `b` are sums of local finite-element contributions and `E` is
-the AgFEM extension from master degrees of freedom to the active background
-lattice.
+### Allocation 
 
-Changing the form, finite-element spaces, or background mesh requires a new
-`StaticSystem`; changing coefficients uses `assemble!`; changing cut geometry
-or aggregate roots uses `refresh_geometry!`.
+Allocate once a `StaticSystem` which is our all-in one container for the background system. 
 
-### What's new
+```julia
+system = StaticSystem(mesh, cutdata, roots; form = form) 
+```
 
-During structural geometry refresh, StaticAssembler classifies cell constraints as identity, permutation, or dense. Identity and permutation cells use copies or reindexing instead of dense products. Dense transforms use `mul!` on constraint-sized views, and non-structural refreshes reuse the cached classification.
+### Refreshing the system after incoming inputs
 
-### DONE
+In the case where we get new cutdata/aggregates, we should refresh the StaticSystem and extract from it the extension operator.
 
-- Affine 2D Cartesian background meshes.
-- Scalar and vector Q1/Q2 Lagrange elements, including mixed spaces.
-- Volume integration over `IN` cells and triangulated physical parts of `CUT`
-  cells.
-- Constant and state-dependent bilinear terms and right-hand sides.
-- Projected AgFEM assembly, geometry refresh, sparse-slot reuse, and colored
-  threaded scatter.
-- One CSG geometry tree (single level set or composed unions, intersections,
-  differences, and complements via composed inside/outside states), `Float64`,
-  and identical test/trial spaces in the projected `StaticSystem` path.
-- Scalar coefficient fields represented on Q1 or Q2 background lattices;
-  default quadrature rules upgrade to Q2 when any coefficient field uses Q2.
-- Embedded line-segment quadrature, including multiple segments per cut cell,
-  with degeneracy tolerance scaled to the background spacing.
-- Outward-normal and counter-clockwise `(-n_y,n_x)` tangent-aware boundary
-  operators. Gridap transcriptions must write the tangent as
-  `normal ⋅ TensorValue(0.0, -1.0, 1.0, 0.0)`: `TensorValue` stores components
-  column-major, so the reversed order evaluates to the opposite tangent and
-  flips single-tangent terms such as `Ft`.
-- Piecewise-constant per-facet curvature, masks, tractions, and other data.
-- Local boundary bilinear and right-hand-side terms, including penalty,
-  Neumann, Robin, and user-defined single-sided trace contractions.
+```julia
+refresh_geometry!(system, cutdata, roots)
+E = extension(system)              # sparse n_bg × n_master
+```
 
-### TODO
+### Assembly and final system
 
-- Boundary data varying independently at every quadrature point rather than
-  once per embedded facet.
-- Interior-facet terms such as DG fluxes, CIP stabilization, and ghost
-  penalties, because one contribution reads and couples two adjacent cells.
-- Fully coupled two-sided material-interface terms with independent unknowns
-  and jump/average operators on both sides.
-- Multiple level sets or multiple physical phases in one system.
-- 3D cut surfaces and unstructured background meshes.
+If only coefficients `(k,)` of your variational form changed you can provide them directly to the assembler whitout refreshing the system:
+
+```julia
+B, b_m = assemble!(system, (κ,); threaded = true)
 
 
-### Remarks
+#final AgFEM operator: B is already EᵀAE on master DOFs.
+u_m  = B \ b_m                    # solve on master DOFs
+u_bg = E * u_m                    # map back to the background lattice
+```
+
+For more details and examples consult the documentation.
+
+-------------------------------------------------------------------
+
+## Important limitations
+
+ The update is transactional: a rejected cut geometry or root vector leaves the previous state untouched.
+
+Scope: `Float64`, affine 2D Cartesian backgrounds, identical test and trial elements (possibly mixed Q1/Q2 blocks, scalar or componentwise vector). Systems are single-owner and non-reentrant: `B`, `b_m` and the preallocated buffers are overwritten by the next `assemble!` or `refresh_geometry!`. A source map lives in [docs/details.md](docs/details.md#11-implementation-scope-and-source-map).
 
 - Contributions must have fixed finite support for a given structural state
   so that a reusable sparse pattern can be built. Dense nonlocal boundary
@@ -66,12 +122,52 @@ During structural geometry refresh, StaticAssembler classifies cell constraints 
 - A topology or aggregation change may change the active degrees of freedom
   and sparse pattern. Such a change necessarily takes the structural refresh
   path rather than the coefficient-only hot path.
+  
+During structural geometry refresh, StaticAssembler classifies cell constraints as identity, permutation, or dense. Identity and permutation cells use copies or reindexing instead of dense products. Dense transforms use `mul!` on constraint-sized views, and non-structural refreshes reuse the cached classification.
 
+Changing the form, finite-element spaces, or background mesh requires a new
+`StaticSystem`; changing coefficients uses `assemble!`; changing cut geometry
+or aggregate roots uses `refresh_geometry!`.
 
-StaticAssembler does not own level-set evolution, cut generation, curvature
-estimation, aggregate-root selection, PDE time integration, linear solvers, or
-preconditioners. Geometry producers may provide normals and curvature, and the
-assembler evaluates their effect at cached quadrature points. The quality of
-those supplied geometric quantities is not recoverable inside assembly.
+-------------------------------------------------
 
-Development version.
+# Test suite content
+
+Run everything with `julia --project=. -e 'using Pkg; Pkg.test()'`, or one family
+with `Pkg.test(; test_args=["projection"])` (families: `integration`, `local`,
+`projection`, `assembly`, `lifecycle`).
+
+### Discussion
+
+The suite is not built from self-consistency checks. The independent reference
+is `Gridap` + `GridapEmbedded` through `oracle/StaticAssemblerOracle.jl`: the
+same physical problem is assembled there with a different data layout, DOF
+ordering and extension construction, and the two projected operators are
+compared after an explicit DOF map. Within the engine, whole-assembly results
+are additionally checked against a deliberately naive scalar reference
+(`C·K`, then `·Cᵀ`, explicit loops), so the fast kernels are validated against
+the formula rather than against each other.
+
+What each family pins:
+
+| Family | Object under test |
+| --- | --- |
+| `integration` | Reference quadrature rules, cut-domain moments, segment quadrature and normal/tangent orientation on embedded facets |
+| `local` | Raw local blocks and loads: coefficient fields, differential-operator contractions, state-dependent and boundary slots |
+| `projection` | `E`, per-cell `C`, the identity/permutation/dense classification, cross-branch agreement, and warmed-path allocations |
+| `assembly` | Global `B = E'AE` and `b_m = E'b`, serial and threaded, against the scalar reference and the Gridap oracle |
+| `lifecycle` | Structural refresh, cache and sparse-pattern reuse, and preservation of the previous state after a rejected geometry or root vector |
+
+The projection tests report evidence instead of a bare pass: every dense-product
+comparison records the observed absolute difference next to a scale-aware
+roundoff bound, `4n·eps` applied to the absolute-product scales `max|C||K|`,
+`max|C||K||C|ᵀ` and `max|C||f|`, and the worst observed values are printed at
+the end of the run. Representation changes
+are accepted only when the specialized branch and the dense kernel agree within
+that bound; exact equality is required for identity and permutation branches.
+Warmed-path allocations are measured and printed beside the scalar reference, so
+a performance regression that reintroduces allocation is visible.
+
+Known coupling: the tests need the pinned `Gridap`/`GridapEmbedded` majors, and
+the adapter intentionally asserts their private layouts, so a Gridap upgrade
+fails loudly in the extension rather than silently misreading cut data.
