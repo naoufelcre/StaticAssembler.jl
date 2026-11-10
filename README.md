@@ -15,6 +15,7 @@ About **AgFEM** see : **The aggregated unfitted finite element method for ellipt
 If you are interested in this work, please get in touch.
 Contact: **naoufel.cresson@inria.fr** 
 https://www.ljll.fr/~cresson/
+
 -------------------------------------------------
 
 # Quickstart
@@ -112,62 +113,11 @@ For more details and examples consult the documentation.
 
 ## Important limitations
 
- The update is transactional: a rejected cut geometry or root vector leaves the previous state untouched.
+It needs to remain clear to the reader that this is a research package and we do not claim it to be a fully fleshed out FEM framework. In particular notable limitations are: 
 
-Scope: `Float64`, affine 2D Cartesian backgrounds, identical test and trial elements (possibly mixed Q1/Q2 blocks, scalar or componentwise vector). Systems are single-owner and non-reentrant: `B`, `b_m` and the preallocated buffers are overwritten by the next `assemble!` or `refresh_geometry!`. A source map lives in [docs/details.md](docs/details.md#11-implementation-scope-and-source-map).
+1. Rigidity of the inputs: `Float64`, 2D Cartesian grids, identical test and trial elements (possibly mixed Q1/Q2 blocks, scalar or componentwise vector).
 
-- Contributions must have fixed finite support for a given structural state
-  so that a reusable sparse pattern can be built. Dense nonlocal boundary
-  integral operators are not handled by this local sparse assembler.
-- A topology or aggregation change may change the active degrees of freedom
-  and sparse pattern. Such a change necessarily takes the structural refresh
-  path rather than the coefficient-only hot path.
-  
-During structural geometry refresh, StaticAssembler classifies cell constraints as identity, permutation, or dense. Identity and permutation cells use copies or reindexing instead of dense products. Dense transforms use `mul!` on constraint-sized views, and non-structural refreshes reuse the cached classification.
+2. Changing the form, finite-element spaces, or background mesh requires a new
+`StaticSystem`.
 
-Changing the form, finite-element spaces, or background mesh requires a new
-`StaticSystem`; changing coefficients uses `assemble!`; changing cut geometry
-or aggregate roots uses `refresh_geometry!`.
-
--------------------------------------------------
-
-# Test suite content
-
-Run everything with `julia --project=. -e 'using Pkg; Pkg.test()'`, or one family
-with `Pkg.test(; test_args=["projection"])` (families: `integration`, `local`,
-`projection`, `assembly`, `lifecycle`).
-
-### Discussion
-
-The suite is not built from self-consistency checks. The independent reference
-is `Gridap` + `GridapEmbedded` through `oracle/StaticAssemblerOracle.jl`: the
-same physical problem is assembled there with a different data layout, DOF
-ordering and extension construction, and the two projected operators are
-compared after an explicit DOF map. Within the engine, whole-assembly results
-are additionally checked against a deliberately naive scalar reference
-(`C·K`, then `·Cᵀ`, explicit loops), so the fast kernels are validated against
-the formula rather than against each other.
-
-What each family pins:
-
-| Family | Object under test |
-| --- | --- |
-| `integration` | Reference quadrature rules, cut-domain moments, segment quadrature and normal/tangent orientation on embedded facets |
-| `local` | Raw local blocks and loads: coefficient fields, differential-operator contractions, state-dependent and boundary slots |
-| `projection` | `E`, per-cell `C`, the identity/permutation/dense classification, cross-branch agreement, and warmed-path allocations |
-| `assembly` | Global `B = E'AE` and `b_m = E'b`, serial and threaded, against the scalar reference and the Gridap oracle |
-| `lifecycle` | Structural refresh, cache and sparse-pattern reuse, and preservation of the previous state after a rejected geometry or root vector |
-
-The projection tests report evidence instead of a bare pass: every dense-product
-comparison records the observed absolute difference next to a scale-aware
-roundoff bound, `4n·eps` applied to the absolute-product scales `max|C||K|`,
-`max|C||K||C|ᵀ` and `max|C||f|`, and the worst observed values are printed at
-the end of the run. Representation changes
-are accepted only when the specialized branch and the dense kernel agree within
-that bound; exact equality is required for identity and permutation branches.
-Warmed-path allocations are measured and printed beside the scalar reference, so
-a performance regression that reintroduces allocation is visible.
-
-Known coupling: the tests need the pinned `Gridap`/`GridapEmbedded` majors, and
-the adapter intentionally asserts their private layouts, so a Gridap upgrade
-fails loudly in the extension rather than silently misreading cut data.
+3.  Dense nonlocal boundary integral operators are not handled.
