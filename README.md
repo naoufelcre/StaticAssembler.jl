@@ -1,4 +1,4 @@
-# ![visuel](icon.svg) StaticAssembler.jl
+# StaticAssembler.jl
 
 Specialized custom assembler and data structure for aggregated nodal finite element methods on 2D evolving domains.
 
